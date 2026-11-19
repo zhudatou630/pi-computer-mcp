@@ -22,14 +22,17 @@ export function formatNode(n: UiNode, indent = true): string {
 	return `${indent ? "  ".repeat(Math.min(n.depth, 12)) : ""}${n.ref} ${n.role}${name}${value}${box}${flags.length ? ` [${flags.join(",")}]` : ""}`;
 }
 
-export type Filter = { query?: string; role?: string; states?: string[]; interactiveOnly?: boolean };
+export type Filter = { query?: string; role?: string; name?: string; states?: string[]; interactiveOnly?: boolean };
 
 /** Keep nodes matching every given condition. `interactive` decides what counts as interactive for the source. */
+export const isFiltered = (f: Filter) => !!(f.query || f.role || f.name || f.states?.length || f.interactiveOnly);
+
 export function filterNodes(nodes: UiNode[], f: Filter, interactive: (n: UiNode) => boolean): UiNode[] {
 	const q = f.query?.toLowerCase();
 	return nodes.filter(
 		(n) =>
 			(!f.role || n.role === f.role) &&
+			(!f.name || n.name === f.name) &&
 			(!q || `${n.role} ${n.name} ${n.value ?? ""}`.toLowerCase().includes(q)) &&
 			(!f.states?.length || f.states.every((s) => n.states.includes(s))) &&
 			(!f.interactiveOnly || interactive(n)),

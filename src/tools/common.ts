@@ -24,7 +24,7 @@ export const out = (properties: Record<string, S>, required: string[] = []): S =
 export const rect = obj({ x: num(), y: num(), width: num(), height: num() }, ["x", "y", "width", "height"]);
 export const RECEIPT = {
 	outcome: enm(["delivered", "refused", "unknown"], "delivered = sent; refused = certainly not sent; unknown = may have been sent, do not blindly retry"),
-	route: str("how it was sent: xtest, atspi-action, atspi-text, wm, cdp-input, cdp-dom"),
+	route: str("how it was sent: xtest, atspi-action, atspi-text, wm, spawn, cdp-input, cdp-dom, cdp-page"),
 	verified: bool("present only when the effect was checked afterwards"),
 	code: str("error code when not delivered"),
 	message: str(),
@@ -44,7 +44,7 @@ export async function rootForWindow(ctx: Ctx, id: string) {
 	if (!m.root) {
 		const candidates = m.candidates.map((r) => ({ ref: r.ref, role: r.role, name: r.name }));
 		if (candidates.length)
-			throw new ToolError("AMBIGUOUS", `window ${win.id} cannot be told apart from its app's other windows; observe one of the candidate refs`, { details: { candidates } });
+			throw new ToolError("AMBIGUOUS", `window ${win.id} cannot be told apart from its app's other windows (same title and place); activate it or move it (window op=activate/move), then observe again`, { details: { candidates } });
 		throw new ToolError("NO_ACCESSIBLE_ROOT", `window ${win.id} (${win.class}) has no accessibility tree (app started before AT-SPI, Electron, or no a11y support); use screenshot + pointer input`);
 	}
 	ctx.atspi.bindWindow(m.root.ref, win.id);
@@ -72,7 +72,10 @@ export async function resolvePoint(ctx: Ctx, a: PointArgs): Promise<{ x: number;
 	return { x: Math.round(a.x), y: Math.round(a.y), window };
 }
 
-/** Move there and make sure no other managed window is under the pointer (menus and popups are not managed). */
+/**
+ * Move there and make sure no other managed window is under the pointer (menus and popups are not managed). A refusal
+ * means the click/scroll was not sent; the pointer itself has moved.
+ */
 export async function checkLanding(p: { x: number; y: number; window?: string }) {
 	if (!p.window) return;
 	await x11.moveTo(p.x, p.y);
@@ -83,6 +86,9 @@ export async function checkLanding(p: { x: number; y: number; window?: string })
 
 export async function checkActive(window: string | undefined) {
 	if (!window) return;
+	const id = x11.normId(window);
 	const active = await x11.activeWindow();
-	if (active !== x11.normId(window)) throw new ToolError("FOCUS_CHANGED", `the active window is ${active ?? "none"}, not ${window}; activate it first`, { details: { active } });
+	if (active === id) return;
+	if (!(await x11.managedIds()).has(id)) throw new ToolError("WINDOW_GONE", `window ${window} no longer exists; call windows`);
+	throw new ToolError("FOCUS_CHANGED", `the active window is ${active ?? "none"}, not ${window}; activate it first`, { details: { active } });
 }

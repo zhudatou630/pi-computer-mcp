@@ -14,6 +14,11 @@ export class InputQueue {
 		this.#tail = next.catch(() => {});
 		return next;
 	}
+
+	/** Settles when every input queued so far has finished (its cleanup included). */
+	idle(): Promise<unknown> {
+		return this.#tail;
+	}
 }
 
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {

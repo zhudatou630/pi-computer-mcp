@@ -13,7 +13,6 @@ const VALUE = "org.a11y.atspi.Value";
 const PROP = "org.freedesktop.DBus.Properties";
 const CALL_MS = 3000; // a single hung call can stall the whole accessibility bus, so every call is bounded
 const PARALLEL = 16;
-const MAX_CHILDREN = 400;
 const TOP_ROLES = new Set(["frame", "dialog", "window", "alert", "file chooser"]);
 const INTERACTIVE = new Set(["button", "push button", "toggle button", "check box", "radio button", "menu item", "check menu item", "radio menu item", "menu", "text", "entry", "password text", "combo box", "slider", "spin button", "link", "page tab", "tree item", "list item", "table cell", "icon"]);
 
@@ -35,6 +34,69 @@ export type Root = { ref: string; app: string; pid?: number; role: string; name:
 export type Coverage = { complete: boolean; visited: number; errors: number; truncatedBy?: "maxNodes" | "maxDepth" };
 
 const unwrap = (v: any) => (v && typeof v === "object" && "signature" in v && "value" in v ? v.value : v);
+
+/** The app did not answer in time: busy or hung, which is not the same as gone. */
+class AtspiTimeout extends Error {}
+
+export type Box = [number, number, number, number];
+/** One element as read from the bus. `partial`: some of its reads failed; `statesUnknown`: its states could not be read. */
+export type RawNode = { name: string; role: string; states: string[]; box?: Box; actions: string[]; value?: string; kids: Obj[]; partial: boolean; statesUnknown?: boolean };
+export type WalkOptions = {
+	maxDepth: number;
+	/** Elements to read, failed reads included. */
+	maxNodes: number;
+	/** "default": on-screen elements that are named or interactive. "onScreen": every element with an on-screen box (for filters). */
+	keep?: "default" | "onScreen";
+};
+
+const onScreen = (box?: Box) => box !== undefined && box[2] > 1 && box[3] > 1 && box[0] > -10_000;
+
+/**
+ * Breadth-first walk from `root`, reading at most maxNodes elements; when the budget runs out the elements read so far
+ * are kept. GTK often leaves SHOWING unset, so an on-screen box is the visibility signal. The top two levels are always kept.
+ */
+export async function walk(root: Obj, read: (o: Obj) => Promise<RawNode>, refOf: (o: Obj, role: string) => string, options: WalkOptions): Promise<{ nodes: UiNode[]; coverage: Coverage }> {
+	const nodes: UiNode[] = [];
+	const coverage: Coverage = { complete: true, visited: 0, errors: 0 };
+	let attempted = 0;
+	let level = [{ o: root, depth: 0 }];
+	while (level.length && coverage.truncatedBy !== "maxNodes") {
+		const next: { o: Obj; depth: number }[] = [];
+		for (let i = 0; i < level.length; ) {
+			const room = options.maxNodes - attempted;
+			if (room <= 0) {
+				coverage.truncatedBy = "maxNodes";
+				break;
+			}
+			const batch = level.slice(i, i + Math.min(PARALLEL, room));
+			i += batch.length;
+			attempted += batch.length;
+			const results = await Promise.all(batch.map((x) => read(x.o).then((n) => ({ ...n, ...x }), () => undefined)));
+			for (const n of results) {
+				if (!n) {
+					coverage.errors++;
+					continue;
+				}
+				coverage.visited++;
+				if (n.partial) coverage.errors++;
+				const visible = onScreen(n.box);
+				const node: UiNode = { ref: refOf(n.o, n.role), role: n.role, name: n.name, depth: n.depth, states: n.states, ...(n.actions.length ? { actions: n.actions } : {}) };
+				if (n.value) node.value = n.value;
+				if (visible) node.box = n.box;
+				if (isInteractive(node) && !n.statesUnknown && !n.states.includes("sensitive")) node.states = [...node.states, "disabled"];
+				const unnamedCell = n.role === "table cell" && !n.name;
+				const keep = options.keep === "onScreen" ? visible : visible && (!!n.name || isInteractive(node)) && !unnamedCell;
+				if (n.depth <= 1 || keep) nodes.push(node);
+				// Walk into off-screen containers too: GTK keeps real buttons inside 1x1 boxes.
+				if (n.depth < options.maxDepth) for (const o of n.kids) next.push({ o, depth: n.depth + 1 });
+				else if (n.kids.length) coverage.truncatedBy ??= "maxDepth";
+			}
+		}
+		level = next;
+	}
+	coverage.complete = !coverage.truncatedBy && coverage.errors === 0;
+	return { nodes, coverage };
+}
 
 export class Atspi {
 	#bus?: Promise<any>;
@@ -68,7 +130,7 @@ export class Atspi {
 
 	async #raw(bus: any, o: Obj, iface: string, member: string, signature = "", body: unknown[] = []): Promise<any[]> {
 		let timer: NodeJS.Timeout | undefined;
-		const timeout = new Promise<never>((_, reject) => (timer = setTimeout(() => reject(new Error(`AT-SPI ${member} timed out`)), CALL_MS)));
+		const timeout = new Promise<never>((_, reject) => (timer = setTimeout(() => reject(new AtspiTimeout(`AT-SPI ${member} timed out`)), CALL_MS)));
 		try {
 			const reply = await Promise.race([bus.call(new dbus.Message({ destination: o.dest, path: o.path, interface: iface, member, signature, body })), timeout]);
 			return reply.body;
@@ -112,8 +174,11 @@ export class Atspi {
 		const [role, state] = await Promise.all([
 			this.#call(rec.o, ACC, "GetRoleName").then((r) => String(r[0])),
 			this.#call(rec.o, ACC, "GetState").then((r) => stateNames(r[0])),
-		]).catch(() => {
-			throw new ToolError("STALE_REF", `${ref} is gone (its window or app closed or rebuilt it); observe again`);
+		]).catch((e) => {
+			if (e instanceof AtspiTimeout) throw new ToolError("APP_BUSY", `the app of ${ref} did not answer within ${CALL_MS / 1000} s (busy, or a modal loop); try again`);
+			// An error reply (unknown object, service gone) means the element is gone; anything else (the bus itself) does not.
+			if (e instanceof dbus.DBusError) throw new ToolError("STALE_REF", `${ref} is gone (its window or app closed or rebuilt it); observe again`);
+			throw e;
 		});
 		if (state.includes("defunct")) throw new ToolError("STALE_REF", `${ref} is defunct; observe again`);
 		if (role !== rec.role) throw new ToolError("STALE_REF", `${ref} was a ${rec.role} and is now a ${role}; observe again`);
@@ -121,35 +186,36 @@ export class Atspi {
 	}
 
 	/** Apps on the bus, with their process ids. */
-	async apps(): Promise<{ name: string; o: Obj; pid?: number }[]> {
+	/** `unreadable`: the app did not answer in time, so its name is not known. */
+	async apps(): Promise<{ name: string; o: Obj; pid?: number; unreadable?: boolean }[]> {
 		const [kids] = await this.#call({ dest: "org.a11y.atspi.Registry", path: "/org/a11y/atspi/accessible/root" }, ACC, "GetChildren");
 		const apps = await Promise.all(
 			(kids as [string, string][]).map(async ([dest, path]) => {
 				const o = { dest, path };
 				const [name, pid] = await Promise.all([
-					this.#prop(o, ACC, "Name").then(String, () => ""),
+					this.#prop(o, ACC, "Name").then(String, (e) => (e instanceof AtspiTimeout ? undefined : "")),
 					this.#call({ dest: "org.freedesktop.DBus", path: "/org/freedesktop/DBus" }, "org.freedesktop.DBus", "GetConnectionUnixProcessID", "s", [dest]).then((r) => Number(r[0]), () => undefined),
 				]);
-				return { name, o, ...(pid ? { pid } : {}) };
+				return { name: name ?? "", o, ...(pid ? { pid } : {}), ...(name === undefined ? { unreadable: true } : {}) };
 			}),
 		);
-		return apps.filter((a) => a.name);
+		return apps.filter((a) => a.name || a.unreadable);
 	}
 
 	/** Top-level frames and dialogs of every app. */
 	async roots(): Promise<Root[]> {
 		const out: Root[] = [];
 		await Promise.all(
-			(await this.apps()).map(async (app) => {
+			(await this.apps()).filter((app) => !app.unreadable).map(async (app) => {
 				const [kids] = await this.#call(app.o, ACC, "GetChildren").catch(() => [[]]);
 				await Promise.all(
 					(kids as [string, string][]).slice(0, 50).map(async ([dest, path]) => {
 						const o = { dest, path };
 						const [role, name, states, box] = await Promise.all([
 							this.#call(o, ACC, "GetRoleName").then((r) => String(r[0]), () => ""),
-							this.#prop(o, ACC, "Name").then(String, () => ""),
+							this.#prop(o, ACC, "Name").then((v) => String(v).trim(), () => ""),
 							this.#call(o, ACC, "GetState").then((r) => stateNames(r[0]), () => [] as string[]),
-							this.#call(o, COMP, "GetExtents", "u", [0]).then((r) => r[0] as [number, number, number, number], () => undefined),
+							this.#call(o, COMP, "GetExtents", "u", [0]).then((r) => r[0] as Box, () => undefined),
 						]);
 						if (TOP_ROLES.has(role)) out.push({ ref: this.#ref(o, role), app: app.name, ...(app.pid ? { pid: app.pid } : {}), role, name, ...(box ? { box } : {}), states });
 					}),
@@ -169,30 +235,32 @@ export class Atspi {
 		const apps = await this.apps();
 		const needle = name.toLowerCase();
 		const exact = apps.filter((a) => a.name.toLowerCase() === needle);
-		const matches = exact.length ? exact : apps.filter((a) => a.name.toLowerCase().includes(needle));
+		const matches = exact.length ? exact : apps.filter((a) => a.name && a.name.toLowerCase().includes(needle));
+		const unreadable = apps.filter((a) => a.unreadable).length;
+		if (!matches.length && unreadable) throw new ToolError("APP_BUSY", `no app matching "${name}" among those that answered; ${unreadable} did not answer in time`);
 		if (!matches.length) throw new ToolError("NOT_FOUND", `no accessible app matching "${name}"`, { details: { apps: apps.map((a) => a.name) } });
 		if (matches.length > 1) throw new ToolError("AMBIGUOUS", `${matches.length} apps match "${name}"`, { details: { candidates: matches.map((a) => a.name) } });
 		return { ref: this.#ref(matches[0].o, "application"), name: matches[0].name, o: matches[0].o };
 	}
 
-	async #node(o: Obj) {
+	async #node(o: Obj): Promise<RawNode> {
+		let partial = false;
+		const soft = <T>(fallback: T) => () => ((partial = true), fallback);
 		const [name, role, ifaces, states] = await Promise.all([
-			this.#prop(o, ACC, "Name").then((v) => String(v ?? "")),
+			this.#prop(o, ACC, "Name").then((v) => String(v ?? "").trim()),
 			this.#call(o, ACC, "GetRoleName").then((r) => String(r[0])),
-			this.#call(o, ACC, "GetInterfaces").then((r) => r[0] as string[], () => [] as string[]),
-			this.#call(o, ACC, "GetState").then((r) => stateNames(r[0]), () => [] as string[]),
+			this.#call(o, ACC, "GetInterfaces").then((r) => r[0] as string[], soft([] as string[])),
+			this.#call(o, ACC, "GetState").then((r) => stateNames(r[0]), () => undefined),
 		]);
-		let childError = false;
+		if (!states) partial = true;
+		// Every read that decides whether a node is kept or matched counts: a gap must not look like absence.
 		const [box, actions, value, kids] = await Promise.all([
-			ifaces.includes(COMP) ? this.#call(o, COMP, "GetExtents", "u", [0]).then((r) => r[0] as [number, number, number, number], () => undefined) : undefined,
-			ifaces.includes(ACT) ? this.#actions(o).catch(() => []) : [],
-			ifaces.includes(TEXT) && ifaces.includes(EDIT) ? this.#text(o, 500).then((t) => t.text, () => undefined) : undefined,
-			this.#call(o, ACC, "GetChildren").then(
-				(r) => r[0] as [string, string][],
-				() => ((childError = true), [] as [string, string][]),
-			),
+			ifaces.includes(COMP) ? this.#call(o, COMP, "GetExtents", "u", [0]).then((r) => r[0] as Box, soft(undefined)) : undefined,
+			ifaces.includes(ACT) ? this.#actions(o).catch(soft([] as string[])) : [],
+			ifaces.includes(TEXT) && ifaces.includes(EDIT) ? this.#text(o, 500).then((t) => t.text, soft(undefined)) : undefined,
+			this.#call(o, ACC, "GetChildren").then((r) => (r[0] as [string, string][]).map(([dest, path]) => ({ dest, path })), soft([] as Obj[])),
 		]);
-		return { name, role, ifaces, states, box, actions, value, kids, childError };
+		return { name, role, states: states ?? [], box, actions, value, kids, partial, ...(states ? {} : { statesUnknown: true }) };
 	}
 
 	async #actions(o: Obj): Promise<string[]> {
@@ -206,51 +274,11 @@ export class Atspi {
 		return { text: String(text), length: count, truncated: count > max };
 	}
 
-	/**
-	 * Breadth-first walk from `root`, bounded by depth and node count. Keeps nodes with a real on-screen box that are
-	 * named or interactive (GTK often leaves SHOWING unset, so a box is the signal), plus the top two levels.
-	 */
-	async observe(root: Obj, options: { maxDepth: number; maxNodes: number; window?: string }): Promise<{ nodes: UiNode[]; coverage: Coverage }> {
-		const nodes: UiNode[] = [];
-		const coverage: Coverage = { complete: true, visited: 0, errors: 0 };
-		let level = [{ o: root, depth: 0 }];
-		while (level.length) {
-			const next: { o: Obj; depth: number }[] = [];
-			for (let i = 0; i < level.length; i += PARALLEL) {
-				const batch = level.slice(i, i + PARALLEL);
-				const read = await Promise.all(batch.map((x) => this.#node(x.o).then((n) => ({ ...n, ...x }), () => undefined)));
-				for (const n of read) {
-					if (!n) {
-						coverage.errors++;
-						continue;
-					}
-					coverage.visited++;
-					if (n.childError) coverage.errors++;
-					const onScreen = n.box !== undefined && n.box[2] > 1 && n.box[3] > 1 && n.box[0] > -10_000;
-					const node: UiNode = { ref: this.#ref(n.o, n.role, options.window), role: n.role, name: n.name, depth: n.depth, states: n.states, ...(n.actions.length ? { actions: n.actions } : {}) };
-					if (n.value) node.value = n.value;
-					if (onScreen) node.box = n.box;
-					if (isInteractive(node) && !n.states.includes("sensitive")) node.states = [...node.states, "disabled"];
-					const unnamedCell = n.role === "table cell" && !n.name.trim();
-					if (n.depth <= 1 || (onScreen && (n.name.trim() || isInteractive(node)) && !unnamedCell)) nodes.push(node);
-					// Walk into off-screen containers too: GTK keeps real buttons inside 1x1 boxes.
-					if (n.depth < options.maxDepth) for (const [dest, path] of n.kids.slice(0, MAX_CHILDREN)) next.push({ o: { dest, path }, depth: n.depth + 1 });
-					else if (n.kids.length) coverage.truncatedBy ??= "maxDepth";
-					if (n.kids.length > MAX_CHILDREN) coverage.truncatedBy ??= "maxNodes";
-				}
-				if (coverage.visited + next.length > options.maxNodes) {
-					coverage.truncatedBy = "maxNodes";
-					next.length = 0;
-					break;
-				}
-			}
-			level = next;
-		}
-		coverage.complete = !coverage.truncatedBy && coverage.errors === 0;
-		return { nodes, coverage };
+	async observe(root: Obj, options: WalkOptions & { window?: string }): Promise<{ nodes: UiNode[]; coverage: Coverage }> {
+		return walk(root, (o) => this.#node(o), (o, role) => this.#ref(o, role, options.window), options);
 	}
 
-	async observeRef(ref: string, options: { maxDepth: number; maxNodes: number }) {
+	async observeRef(ref: string, options: WalkOptions) {
 		const { o, window } = await this.check(ref);
 		return this.observe(o, { ...options, window });
 	}
@@ -315,21 +343,32 @@ export class Atspi {
 		return actions[index];
 	}
 
-	/** Replace the text, or insert at the caret. Returns the text read back (first 20k chars). */
-	async setText(ref: string, text: string, mode: "replace" | "insert"): Promise<string> {
+	/**
+	 * Replace the text, or insert at the caret; optionally give the element keyboard focus first. Returns the text read
+	 * back (first 20k chars) and, when it could be worked out, the text that was expected.
+	 */
+	async setText(ref: string, text: string, mode: "replace" | "insert", focus = false): Promise<{ text: string; expected?: string; focused?: boolean }> {
 		const { o } = await this.check(ref);
 		const ifaces: string[] = await this.#call(o, ACC, "GetInterfaces").then((r) => r[0], () => []);
 		if (!ifaces.includes(EDIT)) throw new ToolError("NOT_EDITABLE", `${ref} is not an editable text field`);
+		// Focus first: GTK entries select their whole text on focus, which would leave the new text selected.
+		const focused = focus ? Boolean((await this.#call(o, COMP, "GrabFocus").catch(() => [false]))[0]) : undefined;
 		let done: boolean;
+		let expected: string | undefined = text;
 		if (mode === "insert") {
+			const before = ifaces.includes(TEXT) ? await this.#text(o, 20_000).catch(() => undefined) : undefined;
 			const caret = ifaces.includes(TEXT) ? Number(await this.#prop(o, TEXT, "CaretOffset").catch(() => -1)) : -1;
-			const at = caret >= 0 ? caret : Number((await this.#prop(o, TEXT, "CharacterCount").catch(() => 0)) || 0);
+			const at = caret >= 0 ? caret : (before?.length ?? 0);
+			// AT-SPI offsets count code points.
+			const chars = before && !before.truncated ? [...before.text] : undefined;
+			expected = chars && at <= chars.length ? chars.slice(0, at).join("") + text + chars.slice(at).join("") : undefined;
 			[done] = await this.#call(o, EDIT, "InsertText", "isi", [at, text, Buffer.byteLength(text)]);
 		} else {
 			[done] = await this.#call(o, EDIT, "SetTextContents", "s", [text]);
 		}
 		if (!done) throw new ToolError("ACTION_FAILED", `the app declined the text change on ${ref}`, { outcome: "unknown" });
-		return (await this.#text(o, 20_000)).text;
+		const back = await this.#text(o, 20_000);
+		return { text: back.text, ...(expected !== undefined && !back.truncated ? { expected } : {}), ...(focused !== undefined ? { focused } : {}) };
 	}
 
 	/** Screen box of a live element; refuses elements without a real on-screen box. */
@@ -338,11 +377,6 @@ export class Atspi {
 		const box = (await this.#call(o, COMP, "GetExtents", "u", [0]).catch(() => [undefined]))[0] as [number, number, number, number] | undefined;
 		if (!box || box[2] <= 1 || box[3] <= 1 || box[0] < -10_000) throw new ToolError("NOT_VISIBLE", `${ref} has no on-screen box (scroll it into view or observe again)`);
 		return box;
-	}
-
-	async focus(ref: string) {
-		const { o } = await this.check(ref);
-		await this.#call(o, COMP, "GrabFocus").catch(() => {});
 	}
 
 	close() {
@@ -354,7 +388,7 @@ export class Atspi {
  * Pair X windows with AT-SPI roots. Same process is required; then title and geometry decide. A window whose best
  * candidates tie is ambiguous rather than guessed.
  */
-export function matchRoots<W extends { id: string; pid?: number; title: string; x: number; y: number; width: number; height: number }>(
+export function matchRoots<W extends { id: string; pid?: number; title: string; x: number; y: number; width: number; height: number; active?: boolean }>(
 	windows: W[],
 	roots: Root[],
 ): Map<string, { root?: Root; candidates: Root[] }> {
@@ -367,6 +401,8 @@ export function matchRoots<W extends { id: string; pid?: number; title: string; 
 			if (d <= 8) s += 2;
 			else if (d <= 120) s += 1; // client-side decorations and shadows shift GTK frames a little
 		}
+		// Toolkits mark the focused toplevel "active": this tells apart look-alike windows when one of them is focused.
+		if (w.active !== undefined && r.states.includes("active") === w.active) s += 1;
 		return s;
 	};
 	const out = new Map<string, { root?: Root; candidates: Root[] }>();

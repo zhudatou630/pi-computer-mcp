@@ -61,6 +61,15 @@ test("notifications/cancelled aborts the running call", async () => {
 	assert.equal(r.result.structuredContent.code, "CANCELLED");
 });
 
+test("after stop, running calls are cancelled and new ones refused", async () => {
+	const s = createServer({ name: "t", version: "1", tools: [echo, slow] });
+	const pending = s.handle({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow", arguments: {} } }) as Promise<any>;
+	s.stop();
+	assert.equal((await pending).result.structuredContent.code, "CANCELLED");
+	const later: any = await s.handle({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: { text: "x" } } });
+	assert.equal(later.result.structuredContent.code, "SHUTTING_DOWN");
+});
+
 test("dropEmpty clears placeholders only for listed optional keys", () => {
 	assert.deepEqual(dropEmpty({ target: "web", query: "", ref: null, text: "" }, ["query", "ref"]), { target: "web", text: "" });
 	assert.deepEqual(dropEmpty({ args: [] }, ["args"]), {});

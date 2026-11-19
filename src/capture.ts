@@ -58,7 +58,8 @@ export class Captures {
 	/** Grab `source` from the screen as JPEG. Pixels are what is visible: overlapping windows are included. */
 	async grab(screen: Size, source: Rect, maxEdge: number | undefined, window?: Capture["window"]): Promise<{ capture: Capture; data: string }> {
 		const p = plan(screen, source, maxEdge);
-		const file = join(this.#dir, `shot-${++this.#n}.jpg`);
+		const n = ++this.#n; // taken once: concurrent grabs must not share an id
+		const file = join(this.#dir, `shot-${n}.jpg`);
 		const scaled = p.image.width !== p.source.width || p.image.height !== p.source.height;
 		const args = ["-o", "-q", "75", "-a", `${p.source.x},${p.source.y},${p.source.width},${p.source.height}`];
 		if (scaled) args.push("-t", `${p.image.width}x${p.image.height}`);
@@ -66,7 +67,7 @@ export class Captures {
 		const out = scaled ? file.replace(/\.jpg$/, "-thumb.jpg") : file;
 		try {
 			const data = (await readFile(out)).toString("base64");
-			const capture: Capture = { id: `c${this.#n}.${this.#gen}`, screen, ...p, ...(window ? { window } : {}) };
+			const capture: Capture = { id: `c${n}.${this.#gen}`, screen, ...p, ...(window ? { window } : {}) };
 			this.#items.set(capture.id, capture);
 			if (this.#items.size > KEEP) this.#items.delete(this.#items.keys().next().value!);
 			return { capture, data };

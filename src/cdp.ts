@@ -105,20 +105,28 @@ const NAMED: Record<string, [code: string, keyCode: number, text?: string]> = {
 	Home: ["Home", 36], End: ["End", 35], PageUp: ["PageUp", 33], PageDown: ["PageDown", 34], Space: ["Space", 32, " "], Insert: ["Insert", 45],
 	...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`F${i + 1}`, [`F${i + 1}`, 112 + i] as [string, number]])),
 };
-const MOD_BITS: Record<string, number> = { alt: 1, control: 2, ctrl: 2, meta: 4, cmd: 4, shift: 8 };
+const MOD_BITS: Record<string, number> = { alt: 1, control: 2, ctrl: 2, meta: 4, cmd: 4, super: 4, shift: 8 };
+// xdotool/X keysym names, so the same names work for key (desktop) and page_act press.
+const ALIAS: Record<string, string> = { Return: "Enter", KP_Enter: "Enter", Esc: "Escape", BackSpace: "Backspace", Up: "ArrowUp", Down: "ArrowDown", Left: "ArrowLeft", Right: "ArrowRight", Page_Up: "PageUp", Prior: "PageUp", Page_Down: "PageDown", Next: "PageDown" };
+const NAMED_LOWER = new Map<string, string>([...Object.keys(NAMED).map((k) => [k.toLowerCase(), k] as const), ...Object.entries(ALIAS).map(([a, k]) => [a.toLowerCase(), k] as const)]);
 const EDIT_COMMANDS: Record<string, string> = { a: "selectAll", c: "copy", x: "cut", v: "paste", z: "undo", y: "redo" };
 
-/** "Control+Shift+a" -> one keyDown/keyUp pair for CDP Input.dispatchKeyEvent. */
+export type KeySpec = ReturnType<typeof parseKey>;
+
+/** "Control+Shift+a" (or xdotool style "ctrl+Return") -> one keyDown/keyUp pair for CDP Input.dispatchKeyEvent. */
 export function parseKey(spec: string) {
 	const parts = spec.split("+");
-	const keyName = parts.pop()!;
+	let keyName = parts.pop()!;
 	let modifiers = 0;
 	for (const m of parts) {
 		const bit = MOD_BITS[m.toLowerCase()];
 		if (!bit) throw new ToolError("BAD_KEY", `unknown modifier "${m}" in "${spec}" (use Control, Shift, Alt, Meta)`);
 		modifiers |= bit;
 	}
-	const named = NAMED[keyName] ?? (keyName === " " ? NAMED.Space : undefined);
+	const canonical = keyName === " " ? "Space" : keyName.length > 1 ? NAMED_LOWER.get(keyName.toLowerCase()) : undefined;
+	if (canonical) keyName = canonical;
+	if (modifiers & 8 && /^[a-z]$/.test(keyName)) keyName = keyName.toUpperCase(); // Shift+a types "A"
+	const named = canonical ? NAMED[canonical] : undefined;
 	if (!named && [...keyName].length !== 1) throw new ToolError("BAD_KEY", `unknown key "${keyName}" (use a single character or ${Object.keys(NAMED).slice(0, 8).join(", ")}, …)`);
 	const shortcut = (modifiers & ~8) !== 0;
 	if (named) {
@@ -133,7 +141,8 @@ export function parseKey(spec: string) {
 
 // ---- tabs ----
 
-export type PageCapture = { id: string; targetId: string; scale: number; scrollX: number; scrollY: number; width: number; height: number };
+/** A page screenshot's coordinate contract: valid for this document, scroll position and viewport only. */
+export type PageCapture = { id: string; targetId: string; loaderId: string; scale: number; image: { width: number; height: number }; scrollX: number; scrollY: number; width: number; height: number };
 
 export class Tab {
 	readonly cdp: CdpConnection;
@@ -161,11 +170,23 @@ export class Tab {
 		return (await this.send("Page.getFrameTree")).frameTree.frame.loaderId;
 	}
 
-	async waitForLoad(timeoutMs = 10_000) {
+	/** The main frame's document, read so that loader, URL and readyState belong together (undefined mid-navigation). */
+	async #snapshot(): Promise<{ loaderId: string; href: string; ready: string } | undefined> {
+		try {
+			const loaderId = await this.loaderId();
+			const [href, ready] = (await this.eval("[location.href, document.readyState]")) as [string, string];
+			return (await this.loaderId()) === loaderId ? { loaderId, href, ready } : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** Poll until the main frame satisfies `done` and its document is complete; false on timeout. */
+	async waitFor(done: (s: { loaderId: string; href: string }) => boolean | Promise<boolean>, timeoutMs = 10_000) {
 		const end = Date.now() + timeoutMs;
-		await new Promise((r) => setTimeout(r, 200));
 		while (Date.now() < end) {
-			if ((await this.eval("document.readyState").catch(() => "loading")) === "complete") return true;
+			const s = await this.#snapshot();
+			if (s?.ready === "complete" && (await done(s))) return true;
 			await new Promise((r) => setTimeout(r, 150));
 		}
 		return false;
@@ -174,7 +195,28 @@ export class Tab {
 	async navigate(url: string) {
 		const result = await this.send("Page.navigate", { url });
 		if (result.errorText) throw new ToolError("NAVIGATION_FAILED", `navigation failed: ${result.errorText}`, { outcome: "delivered" });
-		return this.waitForLoad();
+		// A same-document navigation (only the hash changes) has no new loader.
+		return this.waitFor((s) => !result.loaderId || s.loaderId === result.loaderId);
+	}
+
+	/** Back (-1) or forward (+1) in this tab's history; loaded when the entry's page is the complete current one. */
+	async history(delta: -1 | 1) {
+		const h = await this.send("Page.getNavigationHistory");
+		const entry = h.entries[h.currentIndex + delta];
+		if (!entry) throw new ToolError("NO_HISTORY", `there is no ${delta < 0 ? "previous" : "next"} page in this tab`);
+		await this.send("Page.navigateToHistoryEntry", { entryId: entry.id });
+		// Two entries can share a URL (pushState): the current entry id tells which one is showing.
+		const current = async () => {
+			const now = await this.send("Page.getNavigationHistory");
+			return now.entries[now.currentIndex]?.id === entry.id;
+		};
+		return { url: entry.url as string, loaded: await this.waitFor(current) };
+	}
+
+	async reload() {
+		const before = await this.loaderId();
+		await this.send("Page.reload");
+		return this.waitFor((s) => s.loaderId !== before);
 	}
 
 	async eval(expression: string): Promise<unknown> {
@@ -216,14 +258,23 @@ export class Tab {
 
 	/** Is the element at (x,y) the target or inside it? Otherwise something covers it. */
 	async hits(x: number, y: number, backendNodeId: number, ref: string): Promise<boolean> {
-		await this.send("DOM.getDocument", { depth: 0 });
-		const hit = await this.send("DOM.getNodeForLocation", { x: Math.round(x), y: Math.round(y), includeUserAgentShadowDOM: false }).catch(() => undefined);
-		if (!hit) return false;
-		if (hit.backendNodeId === backendNodeId) return true;
-		const [target, other] = await Promise.all([this.objectId(backendNodeId, ref), this.objectId(hit.backendNodeId, ref).catch(() => undefined)]);
-		if (!other) return false;
-		// Walk out of shadow roots: a hit inside a component's shadow DOM belongs to its host.
-		return this.callOn(target, "function(n){ for (; n; n = n.parentNode || n.host) if (n === this) return true; return false }", [{ objectId: other }]);
+		const target = await this.objectId(backendNodeId, ref);
+		// elementFromPoint takes viewport px like Input events (DOM.getNodeForLocation ignores scrolling). Descend into open
+		// shadow roots, then walk the composed (rendered) ancestors: slotted nodes up through their slot, shadow roots to
+		// their host. Inside a closed shadow root the hit can only be its host: that counts when the target lives there.
+		return this.callOn(
+			target,
+			`function(x, y){
+				const t = this.nodeType === 1 ? this : this.parentElement;
+				let hit = document.elementFromPoint(x, y);
+				while (hit && hit.shadowRoot) { const inner = hit.shadowRoot.elementFromPoint(x, y); if (!inner || inner === hit) break; hit = inner; }
+				for (let n = hit; n; n = n.assignedSlot || n.parentNode || n.host) if (n === t) return true;
+				for (let root = t && t.getRootNode(); root instanceof ShadowRoot; root = root.host.getRootNode())
+					if (root.mode === "closed" && root.host === hit) return true;
+				return false;
+			}`,
+			[x, y],
+		);
 	}
 
 	async mouse(x: number, y: number, o: { button?: "left" | "middle" | "right"; count?: number; modifiers?: number; move?: boolean } = {}) {
@@ -240,8 +291,7 @@ export class Tab {
 		await this.send("Input.dispatchMouseEvent", { type: "mouseWheel", x, y, deltaX: dx, deltaY: dy });
 	}
 
-	async key(spec: string) {
-		const k = parseKey(spec);
+	async key(k: KeySpec) {
 		await this.send("Input.dispatchKeyEvent", { type: k.text ? "keyDown" : "rawKeyDown", ...k });
 		await this.send("Input.dispatchKeyEvent", { type: "keyUp", key: k.key, code: k.code, windowsVirtualKeyCode: k.windowsVirtualKeyCode, modifiers: k.modifiers });
 	}
@@ -262,13 +312,16 @@ export class Tab {
 		const first = shoot();
 		const winner = await Promise.race([first, new Promise((r) => setTimeout(r, 1500)).then(() => undefined)]);
 		const { data } = winner ?? (await Promise.any([first, shoot()]));
-		return { data: data as string, scale, ...v };
+		return { data: data as string, scale, image: { width: Math.round(v.width * scale), height: Math.round(v.height * scale) }, ...v };
 	}
 }
 
 export class Browser {
 	#cdp?: Promise<CdpConnection>;
+	/** Live CDP sessions, by target id. They die with the connection. */
 	#tabs = new Map<string, Tab>();
+	/** Targets this process created. Kept across reconnects, so its own tabs stay closable. */
+	#owned = new Set<string>();
 	#gen: string;
 	#n = 0;
 	#refs = new Map<string, { targetId: string; loaderId: string; backendId: number }>();
@@ -281,10 +334,12 @@ export class Browser {
 	}
 
 	async #connection() {
-		const existing = this.#cdp && (await this.#cdp.catch(() => undefined));
-		if (!existing || existing.closed) {
+		const current = this.#cdp;
+		const existing = current && (await current.catch(() => undefined));
+		// Only the first caller to notice a dead connection replaces it.
+		if ((!existing || existing.closed) && this.#cdp === current) {
 			this.#cdp = connect(this.httpUrl);
-			this.#tabs.clear(); // sessions die with the connection
+			this.#tabs.clear();
 		}
 		return this.#cdp!;
 	}
@@ -293,7 +348,16 @@ export class Browser {
 		const { targetInfos } = await (await this.#connection()).send("Target.getTargets");
 		return (targetInfos as any[])
 			.filter((t) => t.type === "page")
-			.map((t) => ({ tab: t.targetId as string, url: t.url as string, title: t.title as string, mine: this.#tabs.has(t.targetId), owned: this.#tabs.get(t.targetId)?.owned ?? false }));
+			.map((t) => ({ tab: t.targetId as string, url: t.url as string, title: t.title as string, mine: this.#tabs.has(t.targetId) || this.#owned.has(t.targetId), owned: this.#owned.has(t.targetId) }));
+	}
+
+	async #exists(targetId: string) {
+		const found = (await this.targets()).some((t) => t.tab === targetId);
+		if (!found) {
+			this.#tabs.delete(targetId);
+			this.#owned.delete(targetId);
+		}
+		return found;
 	}
 
 	async #attach(targetId: string, owned: boolean) {
@@ -305,6 +369,8 @@ export class Browser {
 		// navigation) stalls. Focus emulation makes it render as visible without switching the person's tab.
 		await tab.send("Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
 		await tab.send("Page.setWebLifecycleState", { state: "active" }).catch(() => {});
+		// The connection may have died meanwhile: never cache a session of a dead connection.
+		if (cdp.closed) throw new Error("CDP connection closed while attaching");
 		this.#tabs.set(targetId, tab);
 		return tab;
 	}
@@ -316,38 +382,51 @@ export class Browser {
 	async open(url?: string) {
 		const cdp = await this.#connection();
 		const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank", newWindow: true, background: true });
-		const tab = await this.#attach(targetId, true);
-		if (url) await tab.navigate(url);
-		return tab;
+		this.#owned.add(targetId);
+		try {
+			const tab = await this.#attach(targetId, true);
+			if (url) await tab.navigate(url);
+			return tab;
+		} catch (e) {
+			// The tab exists (so the receipt is never "refused"): say which, so it can be used or closed.
+			if (e instanceof ToolError) throw new ToolError(e.code, `${e.message} (tab ${targetId} was opened)`, { outcome: e.outcome === "refused" ? "unknown" : e.outcome, details: { ...e.details, tab: targetId } });
+			throw new ToolError("BACKEND_ERROR", `${(e as Error).message} (tab ${targetId} was opened)`, { outcome: "unknown", details: { tab: targetId } });
+		}
 	}
 
 	/** Work in a tab the person (or someone else) opened, named exactly. */
 	async attach(targetId: string) {
-		if (this.#tabs.has(targetId)) return this.#tabs.get(targetId)!;
-		if (!(await this.targets()).some((t) => t.tab === targetId)) throw new ToolError("TARGET_GONE", `no page with id ${targetId}; list tabs`);
-		return this.#attach(targetId, false);
+		await this.#connection();
+		const tab = this.#tabs.get(targetId);
+		if (tab) return tab;
+		if (!(await this.#exists(targetId))) throw new ToolError("TARGET_GONE", `no page with id ${targetId}; list tabs`);
+		return this.#attach(targetId, this.#owned.has(targetId));
 	}
 
 	/** One of this process's tabs, still open. */
 	async tab(targetId: string): Promise<Tab> {
 		await this.#connection();
 		const tab = this.#tabs.get(targetId);
-		if (!tab) throw new ToolError("NOT_ATTACHED", `tab ${targetId} is not one of yours; open a tab, or attach to it explicitly`);
-		if (!(await this.targets()).some((t) => t.tab === targetId)) {
-			this.#tabs.delete(targetId);
-			throw new ToolError("TARGET_GONE", `tab ${targetId} was closed`);
-		}
-		return tab;
+		if (!tab && !this.#owned.has(targetId)) throw new ToolError("NOT_ATTACHED", `tab ${targetId} is not one of yours; open a tab, or attach to it explicitly`);
+		if (!(await this.#exists(targetId))) throw new ToolError("TARGET_GONE", `tab ${targetId} was closed`);
+		// A tab this process opened, after the connection was replaced: attach again.
+		return tab ?? (await this.#attach(targetId, true));
 	}
 
 	async close(targetId: string) {
-		const tab = await this.tab(targetId);
-		if (!tab.owned) throw new ToolError("NOT_OWNED", `tab ${targetId} was attached, not opened by you; detach it instead`);
+		if (!this.#owned.has(targetId)) {
+			if (this.#tabs.has(targetId)) throw new ToolError("NOT_OWNED", `tab ${targetId} was attached, not opened by you; detach it instead`);
+			throw new ToolError("NOT_ATTACHED", `tab ${targetId} is not one of yours`);
+		}
+		const cdp = await this.#connection();
+		if (!(await this.#exists(targetId))) throw new ToolError("TARGET_GONE", `tab ${targetId} was already closed`);
+		await cdp.send("Target.closeTarget", { targetId });
 		this.#tabs.delete(targetId);
-		await tab.cdp.send("Target.closeTarget", { targetId });
+		this.#owned.delete(targetId);
 	}
 
 	async detach(targetId: string) {
+		if (this.#owned.has(targetId)) throw new ToolError("BAD_ARGS", `you opened tab ${targetId}: close it instead`);
 		const tab = this.#tabs.get(targetId);
 		if (!tab) return;
 		this.#tabs.delete(targetId);
@@ -378,10 +457,13 @@ export class Browser {
 
 	/** On exit: close the tabs this process opened, detach the ones it borrowed. */
 	async closeAll() {
-		for (const tab of [...this.#tabs.values()]) {
-			if (tab.owned) await tab.cdp.send("Target.closeTarget", { targetId: tab.targetId }).catch(() => {});
-			else await this.detach(tab.targetId);
+		if (!this.#cdp && !this.#owned.size) return; // never used the browser
+		const cdp = await this.#connection().catch(() => undefined);
+		if (cdp) {
+			for (const targetId of this.#owned) await cdp.send("Target.closeTarget", { targetId }).catch(() => {});
+			for (const tab of [...this.#tabs.values()]) if (!tab.owned) await this.detach(tab.targetId);
 		}
+		this.#owned.clear();
 		this.#tabs.clear();
 		void this.#cdp?.then((c) => c.close()).catch(() => {});
 	}

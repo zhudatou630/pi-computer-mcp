@@ -26,7 +26,11 @@ export function run(cmd: string, args: string[], options: { input?: string; sign
 			if (err) reject(new Error(`${cmd} ${args[0] ?? ""} failed: ${(stderr || err.message).trim()}`));
 			else resolve({ stdout, stderr });
 		});
-		if (options.input !== undefined) child.stdin?.end(options.input);
+		if (options.input !== undefined) {
+			// The command can exit before reading stdin; the callback above reports that, an unhandled EPIPE would crash.
+			child.stdin?.on("error", () => {});
+			child.stdin?.end(options.input);
+		}
 	});
 }
 
@@ -72,7 +76,8 @@ export function parseWindows(text: string): { screen: Size; active?: string; win
 	const windows: XWindow[] = [];
 	for (const block of blocks) {
 		const [idLine, ...lines] = block.split("\n");
-		const prop = (name: string) => lines.find((l) => l.startsWith(`${name} = `) || l.startsWith(`${name}:`))?.replace(/^[^=:]+[=:]\s*/, "");
+		// A missing property prints "NAME:  not found." (or "no such atom on any window."): that is no value.
+		const prop = (name: string) => lines.find((l) => l.startsWith(`${name} = `) || (l.startsWith(`${name}:`) && !/:\s+(not found\.|no such atom)/.test(l)))?.replace(/^[^=:]+[=:]\s*/, "");
 		const num = (label: string) => Number(new RegExp(`${label}\\s*(-?\\d+)`).exec(block)?.[1] ?? NaN);
 		const id = normId(idLine.trim());
 		const cls = prop("WM_CLASS")?.match(/"((?:[^"\\]|\\.)*)"/g)?.map(xpropString) ?? [];
@@ -135,6 +140,13 @@ export async function pointer(): Promise<{ x: number; y: number; window?: string
 
 // ---- window management (wmctrl talks EWMH to the window manager, so close is a polite WM_DELETE_WINDOW) ----
 
+/** Decoration widths around the client area (left, right, top, bottom); zero when the WM does not say. */
+export async function frameExtents(id: string): Promise<{ left: number; right: number; top: number; bottom: number }> {
+	const out = (await run("xprop", ["-id", id, "-notype", "_NET_FRAME_EXTENTS"])).stdout;
+	const [left = 0, right = 0, top = 0, bottom = 0] = /=\s*(.*)/.exec(out)?.[1].split(",").map(Number) ?? [];
+	return { left, right, top, bottom };
+}
+
 export async function windowOp(id: string, op: string, geometry: Partial<Rect> = {}) {
 	const win = await getWindow(id);
 	switch (op) {
@@ -154,10 +166,13 @@ export async function windowOp(id: string, op: string, geometry: Partial<Rect> =
 			await run("wmctrl", ["-i", "-r", win.id, "-b", "remove,maximized_vert,maximized_horz"]);
 			if (win.hidden) await run("wmctrl", ["-i", "-a", win.id]);
 			return;
-		case "move":
+		case "move": {
 			if (geometry.x === undefined || geometry.y === undefined) throw new ToolError("BAD_ARGS", "move needs x and y");
-			await run("xdotool", ["windowmove", win.id, String(Math.round(geometry.x)), String(Math.round(geometry.y))]);
+			// windowmove places the frame; x,y here mean the client area, like everywhere else in this server.
+			const { left, top } = await frameExtents(win.id);
+			await run("xdotool", ["windowmove", win.id, String(Math.round(geometry.x - left)), String(Math.round(geometry.y - top))]);
 			return;
+		}
 		case "resize":
 			if (!geometry.width || !geometry.height) throw new ToolError("BAD_ARGS", "resize needs width and height");
 			await run("xdotool", ["windowsize", win.id, String(Math.round(geometry.width)), String(Math.round(geometry.height))]);
@@ -262,6 +277,11 @@ export async function hold(chord: string, ms: number, signal?: AbortSignal) {
 export const isTypeable = (text: string) => /^[\x20-\x7E\n\t]*$/.test(text);
 
 export async function type(text: string, signal?: AbortSignal) {
-	// via stdin: text starting with "-" would otherwise be parsed as an option
-	await gesture(signal, [], [], ["type", "--clearmodifiers", "--delay", "12", "--file", "-"], text);
+	// xdotool types "\n" as Linefeed, which GTK ignores: send Return between lines instead.
+	const lines = text.split("\n");
+	for (let i = 0; i < lines.length; i++) {
+		if (i) await gesture(signal, [], [], ["key", "--clearmodifiers", "Return"]);
+		// via stdin: text starting with "-" would otherwise be parsed as an option
+		if (lines[i]) await gesture(signal, [], [], ["type", "--clearmodifiers", "--delay", "12", "--file", "-"], lines[i]);
+	}
 }

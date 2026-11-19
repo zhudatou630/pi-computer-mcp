@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { matchRoots, stateNames, type Root } from "../src/atspi.ts";
+import { matchRoots, stateNames, walk, type Obj, type RawNode, type Root } from "../src/atspi.ts";
 import { checkFresh, plan, toScreen, type Capture } from "../src/capture.ts";
 import { axToNodes, parseKey } from "../src/cdp.ts";
 import { InputQueue, poll } from "../src/queue.ts";
@@ -47,6 +47,29 @@ _NET_WM_STATE = _NET_WM_STATE_MAXIMIZED_HORZ, _NET_WM_STATE_MAXIMIZED_VERT, _NET
 	assert.equal(xpropString('"a\\\\b"'), "a\\b");
 });
 
+test("parseWindows treats missing properties as absent", () => {
+	const r = parseWindows(`1920 1080
+_NET_ACTIVE_WINDOW: window id # 0x0
+_NET_CLIENT_LIST_STACKING: window id # 0x1400001
+@@ 0x1400001
+_NET_WM_PID:  not found.
+_NET_WM_NAME:  not found.
+WM_NAME = "xterm"
+WM_CLASS = "xterm", "XTerm"
+_NET_WM_STATE:  not found.
+_NET_WM_WINDOW_TYPE:  no such atom on any window.
+  Absolute upper-left X:  10
+  Absolute upper-left Y:  20
+  Width: 100
+  Height: 50
+  Map State: IsViewable
+`);
+	assert.equal(r.active, undefined);
+	assert.equal(r.windows[0].title, "xterm");
+	assert.equal(r.windows[0].type, "normal");
+	assert.equal(r.windows[0].pid, undefined);
+});
+
 test("capture plan clips to the screen, scales down only, and maps back", () => {
 	const p = plan({ width: 1920, height: 1080 }, { x: 0, y: 0, width: 1920, height: 1080 });
 	assert.deepEqual(p.image, { width: 1280, height: 720 });
@@ -85,6 +108,51 @@ test("matchRoots pairs by pid, then title and geometry, and refuses ties", () =>
 	assert.equal(t.get("0x1")!.candidates.length, 2);
 	// another process's root never matches
 	assert.equal(matchRoots([win("0x1", 5, "A")], [root("r1", 6, "A")]).get("0x1")!.root, undefined);
+	// look-alikes, one focused: the toolkit's "active" state tells them apart
+	const focused = matchRoots([{ ...win("0x1", 7, "X"), active: false }, { ...win("0x2", 7, "X"), active: true }], [root("r1", 7, "X"), { ...root("r2", 7, "X"), states: ["active"] }]);
+	assert.equal(focused.get("0x1")!.root?.ref, "r1");
+	assert.equal(focused.get("0x2")!.root?.ref, "r2");
+	// neither focused: still ambiguous
+	const neither = matchRoots([{ ...win("0x1", 8, "X"), active: false }, { ...win("0x2", 8, "X"), active: false }], [root("r1", 8, "X"), root("r2", 8, "X")]);
+	assert.equal(neither.get("0x1")!.root, undefined);
+});
+
+test("walk keeps what it read within the budget and reports why it stopped", async () => {
+	// root -> 100 children, each named and on screen
+	const kids = Array.from({ length: 100 }, (_, i) => ({ dest: "d", path: `/k${i}` }));
+	const node = (o: Obj): RawNode =>
+		o.path === "/root"
+			? { name: "Root", role: "frame", states: [], box: [0, 0, 500, 500], actions: [], kids, partial: false }
+			: { name: o.path, role: "label", states: [], box: [0, 0, 10, 10], actions: [], kids: [], partial: false };
+	const refOf = (o: Obj) => o.path;
+	const cut = await walk({ dest: "d", path: "/root" }, async (o) => node(o), refOf, { maxDepth: 8, maxNodes: 50 });
+	assert.equal(cut.nodes.length, 50); // root + 49 children, not just the root
+	assert.equal(cut.coverage.truncatedBy, "maxNodes");
+	assert.equal(cut.coverage.complete, false);
+	const all = await walk({ dest: "d", path: "/root" }, async (o) => node(o), refOf, { maxDepth: 8, maxNodes: 500 });
+	assert.equal(all.nodes.length, 101);
+	assert.equal(all.coverage.complete, true);
+	// a partly failed read and a failed read both make the walk incomplete
+	const flaky = await walk({ dest: "d", path: "/root" }, async (o) => (o.path === "/k1" ? Promise.reject(new Error("x")) : { ...node(o), partial: o.path === "/k2" }), refOf, { maxDepth: 8, maxNodes: 500 });
+	assert.deepEqual([flaky.coverage.errors, flaky.coverage.complete], [2, false]);
+	// unreadable states: no "disabled" guessed from a missing "sensitive"
+	const btn = (statesUnknown: boolean) =>
+		walk({ dest: "d", path: "/b" }, async () => ({ name: "OK", role: "button", states: [], box: [0, 0, 10, 10], actions: [], kids: [], partial: statesUnknown, statesUnknown }), refOf, { maxDepth: 1, maxNodes: 5 });
+	assert.deepEqual((await btn(false)).nodes[0].states, ["disabled"]);
+	assert.deepEqual((await btn(true)).nodes[0].states, []);
+});
+
+test("walk keeps unnamed on-screen containers only in onScreen mode", async () => {
+	const tree: Record<string, RawNode> = {
+		"/root": { name: "Win", role: "frame", states: [], box: [0, 0, 500, 500], actions: [], kids: [{ dest: "d", path: "/panel" }], partial: false },
+		"/panel": { name: "", role: "filler", states: [], box: [0, 0, 500, 500], actions: [], kids: [{ dest: "d", path: "/table" }], partial: false },
+		"/table": { name: "", role: "tree table", states: [], box: [0, 0, 400, 400], actions: [], kids: [{ dest: "d", path: "/off" }], partial: false },
+		"/off": { name: "row", role: "table cell", states: [], box: [-2147483648, -2147483648, 10, 10], actions: [], kids: [], partial: false },
+	};
+	const read = async (o: Obj) => tree[o.path];
+	const roles = async (keep: "default" | "onScreen") => (await walk({ dest: "d", path: "/root" }, read, (o) => o.path, { maxDepth: 8, maxNodes: 100, keep })).nodes.map((n) => n.role);
+	assert.deepEqual(await roles("default"), ["frame", "filler"]); // top two levels only
+	assert.deepEqual(await roles("onScreen"), ["frame", "filler", "tree table"]); // never off-screen nodes
 });
 
 test("stateNames decodes both 32-bit words", () => {
@@ -107,6 +175,15 @@ test("input queue runs one at a time and drops cancelled entries", async () => {
 	await assert.rejects(second, (e: any) => e.code === "CANCELLED");
 	await third;
 	assert.deepEqual(order, ["a", "c"]);
+	await q.idle();
+});
+
+test("queue idle waits for running input", async () => {
+	const q = new InputQueue();
+	let done = false;
+	void q.run(undefined, () => new Promise<void>((r) => setTimeout(() => ((done = true), r()), 20)));
+	await q.idle();
+	assert.equal(done, true);
 });
 
 test("poll returns the last value on timeout", async () => {
@@ -133,6 +210,16 @@ test("parseKey builds CDP key events", () => {
 	assert.equal(parseKey("A").text, "A");
 	assert.throws(() => parseKey("Hyper+a"), /modifier/);
 	assert.throws(() => parseKey("Enterr"), /unknown key/);
+	// xdotool names work too
+	assert.equal(parseKey("Return").key, "Enter");
+	assert.equal(parseKey("ctrl+Return").modifiers, 2);
+	assert.equal(parseKey("Down").key, "ArrowDown");
+	assert.equal(parseKey("escape").key, "Escape");
+	assert.equal(parseKey("super+a").modifiers, 4);
+	// Shift types the shifted letter
+	const shifted = parseKey("Shift+a");
+	assert.deepEqual([shifted.key, shifted.text, shifted.code], ["A", "A", "KeyA"]);
+	assert.equal(parseKey("Space").key, " ");
 });
 
 test("axToNodes keeps named and interactive nodes and drops repeated text", () => {
@@ -160,6 +247,8 @@ test("filterNodes and formatTree", () => {
 	assert.deepEqual(filterNodes(nodes, { role: "push button" }, () => true).map((n) => n.ref), ["a2"]);
 	assert.deepEqual(filterNodes(nodes, { query: "nam" }, () => true).map((n) => n.ref), ["a3"]);
 	assert.deepEqual(filterNodes(nodes, { states: ["focused"] }, () => true).map((n) => n.ref), ["a2"]);
+	assert.deepEqual(filterNodes(nodes, { name: "OK" }, () => true).map((n) => n.ref), ["a2"]);
+	assert.deepEqual(filterNodes(nodes, { name: "O" }, () => true).map((n) => n.ref), []);
 	assert.equal(formatTree(nodes.slice(1, 2), { flat: true }), 'a2 push button "OK" @1,2 3x4 [focused]');
 	assert.match(formatTree(nodes, { maxLines: 1 }), /2 more nodes/);
 });

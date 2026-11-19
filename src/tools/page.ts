@@ -1,8 +1,8 @@
 // Web pages in the shared Chromium over CDP: only tabs this process opened or was told to attach to.
 import { DEFAULT_MAX_EDGE } from "../capture.ts";
-import { isPageInteractive, axToNodes, type Tab } from "../cdp.ts";
+import { isPageInteractive, axToNodes, parseKey, type Tab } from "../cdp.ts";
 import { dropEmpty, ok, ToolError, type Tool } from "../mcp.ts";
-import { filterNodes, formatTree } from "../tree.ts";
+import { filterNodes, formatTree, isFiltered } from "../tree.ts";
 import { arr, bool, type Ctx, enm, int, num, obj, out, receipt, str } from "./common.ts";
 
 const MAX_EVAL = 20_000;
@@ -31,7 +31,9 @@ export function pageTools(ctx: Ctx): Tool[] {
 		if (a.captureId) {
 			const c = ctx.pageCaptures.get(a.captureId);
 			if (!c || c.targetId !== tab.targetId) throw new ToolError("CAPTURE_STALE", `unknown page capture ${a.captureId} for this tab; take a new page_screenshot`);
-			const v = await tab.viewport();
+			if (a.x < 0 || a.y < 0 || a.x >= c.image.width || a.y >= c.image.height) throw new ToolError("BAD_ARGS", `point ${a.x},${a.y} is outside the ${c.image.width}x${c.image.height} image`);
+			const [v, loaderId] = await Promise.all([tab.viewport(), tab.loaderId()]);
+			if (loaderId !== c.loaderId) throw new ToolError("CAPTURE_STALE", "the page navigated since that screenshot; take a new one");
 			if (v.scrollX !== c.scrollX || v.scrollY !== c.scrollY || v.width !== c.width || v.height !== c.height) throw new ToolError("CAPTURE_STALE", "the page scrolled or resized since that screenshot; take a new one");
 			return { x: a.x / c.scale, y: a.y / c.scale };
 		}
@@ -42,23 +44,25 @@ export function pageTools(ctx: Ctx): Tool[] {
 		{
 			name: "tabs",
 			kind: "action",
-			description: "Browser tabs. list: every page in the shared Chromium (others' tabs are listed, never touched). open(url?): a new tab of yours, in its own browser window (opened without taking focus). attach(tab): work in a tab the person names (only when asked). close(tab): close a tab you opened. detach(tab): stop using an attached tab. Your opened tabs close when this server exits.",
+			description: "Browser tabs. list: every page in the shared Chromium (others' tabs are listed, never touched). open(url?): a new tab of yours, in its own browser window (opened without taking focus; a page_act click later activates and raises that window, as a real click would). attach(tab): work in a tab the person names (only when asked). close(tab): close a tab you opened. detach(tab): stop using an attached tab. Your opened tabs close when this server exits.",
 			inputSchema: obj({ op: enm(["list", "open", "attach", "close", "detach"]), tab: str(), url: str() }, ["op"]),
 			outputSchema: out({ tabs: arr(tabOut), tab: tabOut, outcome: str() }),
-			run: (raw, signal) =>
-				ctx.queue.run(signal, async () => {
-					const a = dropEmpty(raw, ["tab", "url"]) as { op: string; tab?: string; url?: string };
+			async run(raw, signal) {
+				const a = dropEmpty(raw, ["tab", "url"]) as { op: string; tab?: string; url?: string };
+				if (a.op === "list") {
+					const tabs = await ctx.browser.targets();
+					return ok({ tabs }, tabs.map((t) => `${t.tab} ${t.mine ? (t.owned ? "[yours]" : "[attached]") : "[other]"} ${JSON.stringify(t.title)} ${t.url}`).join("\n"));
+				}
+				return ctx.queue.run(signal, async () => {
 					const need = () => {
 						if (!a.tab) throw new ToolError("BAD_ARGS", `${a.op} needs tab`);
 						return a.tab;
 					};
 					const describe = async (t: Tab) => ({ tab: t.targetId, ...(await t.info()), mine: true, owned: t.owned });
-					if (a.op === "list") {
-						const tabs = await ctx.browser.targets();
-						return ok({ tabs }, tabs.map((t) => `${t.tab} ${t.mine ? (t.owned ? "[yours]" : "[attached]") : "[other]"} ${JSON.stringify(t.title)} ${t.url}`).join("\n"));
-					}
 					if (a.op === "open") {
-						const t = await describe(await ctx.browser.open(a.url));
+						const opened = await ctx.browser.open(a.url);
+						// The tab exists now: a failure to describe it must not lose its id.
+						const t = await describe(opened).catch(() => ({ tab: opened.targetId, url: "", title: "", mine: true, owned: true }));
 						return ok({ outcome: "delivered", tab: t }, `opened ${t.tab} ${t.url}`);
 					}
 					if (a.op === "attach") {
@@ -69,20 +73,21 @@ export function pageTools(ctx: Ctx): Tool[] {
 					else if (a.op === "detach") await ctx.browser.detach(need());
 					else throw new ToolError("BAD_ARGS", `unknown op ${a.op}`);
 					return ok({ outcome: "delivered" }, `${a.op}d ${a.tab}`);
-				}),
+				});
+			},
 		},
 		{
 			name: "page_observe",
 			kind: "read",
 			description: "A page's accessibility tree as `ref role \"name\" =value [states]` (refs p…). Filters return a flat list. Refs stay valid until the element leaves the DOM or the page navigates. For data, page_eval is often cheaper.",
-			inputSchema: obj({ tab: tabParam, query: str("Keep nodes whose role, name or value contains this"), role: str('e.g. "button", "link", "textbox"'), states: arr(str()), interactiveOnly: bool(), maxNodes: int("default 600", { minimum: 10, maximum: 5000 }) }, ["tab"]),
+			inputSchema: obj({ tab: tabParam, query: str("Keep nodes whose role, name or value contains this"), role: str('e.g. "button", "link", "textbox"'), name: str("exact name"), states: arr(str()), interactiveOnly: bool(), maxNodes: int("default 600", { minimum: 10, maximum: 5000 }) }, ["tab"]),
 			outputSchema: out({ url: str(), title: str(), nodes: arr(out({ ref: str(), role: str(), name: str(), value: str(), depth: int(), states: arr(str()) })), truncated: bool() }, ["url", "title", "nodes"]),
 			async run(raw) {
-				const a = dropEmpty(raw, ["query", "role", "states"]) as any;
+				const a = dropEmpty(raw, ["query", "role", "name", "states"]) as any;
 				const tab = await ctx.browser.tab(a.tab);
 				const [{ url, title }, loaderId, ax] = await Promise.all([tab.info(), tab.loaderId(), tab.send("Accessibility.getFullAXTree", {}, 30_000)]);
 				let nodes = axToNodes(ax, (id) => ctx.browser.ref(tab.targetId, loaderId, id));
-				const filtered = a.query || a.role || a.states || a.interactiveOnly;
+				const filtered = isFiltered(a);
 				if (filtered) nodes = filterNodes(nodes, a, isPageInteractive);
 				const max = a.maxNodes ?? 600;
 				const truncated = nodes.length > max;
@@ -97,8 +102,8 @@ export function pageTools(ctx: Ctx): Tool[] {
 				"One action in your tab, with real input events where it matters.",
 				"navigate(url) | back | forward | reload — wait for load (loaded=false if it timed out).",
 				"click(target, button?, count?, modifiers?) | hover(target) — at the element's centre after scrolling it into view; refused (OCCLUDED) if something covers it.",
-				"fill(target, text) replaces a field's text (any language), verified by reading the value back. type(text) inserts at the focus. press(keys) e.g. [\"Enter\"], [\"Control+a\"].",
-				"select(target, value) picks an <option> by value or label. scroll(target?, dx?, dy?) wheel in CSS px.",
+				"fill(target, text) replaces a field's text (any language; text \"\" clears it), verified by reading the value back. type(text) inserts at the focus. press(keys) e.g. [\"Enter\"], [\"Control+a\"]; xdotool names (Return, ctrl+a, Down) work too. All keys are checked before any is sent.",
+				"select(target, value) picks an <option> by value or label. scroll(target?, dx?, dy?) in CSS px: with a target, wheel there and report the scroll position of the element that scrolls; without one, scroll the document.",
 				"target = ref (from page_observe) | selector (CSS, must match exactly one) | x,y (viewport CSS px, or image px with captureId).",
 			].join("\n"),
 			inputSchema: obj(
@@ -122,25 +127,26 @@ export function pageTools(ctx: Ctx): Tool[] {
 				},
 				["tab", "op"],
 			),
-			outputSchema: receipt({ at: out({ x: num(), y: num() }), loaded: bool(), value: str("field value read back (fill/select)"), scroll: out({ x: num(), y: num() }, ) }),
+			outputSchema: receipt({ at: out({ x: num(), y: num() }), loaded: bool(), value: str("field value read back (fill/select)"), scroll: out({ x: num(), y: num() }), scroller: enm(["document", "element"], "what scroll reports on") }),
 			run: (raw, signal) =>
 				ctx.queue.run(signal, async () => {
-					const a = dropEmpty(raw, ["ref", "selector", "captureId", "url", "keys", "value", "button", "modifiers"]) as any;
+					const a = dropEmpty(raw, ["ref", "selector", "captureId", "url", "keys", "button", "modifiers"]) as any;
 					const tab = await ctx.browser.tab(a.tab);
 					const done = (extra: Record<string, unknown>, text: string) => ok({ outcome: "delivered", route: "cdp-input", ...extra }, text);
 					switch (a.op) {
 						case "navigate": {
 							if (!a.url) throw new ToolError("BAD_ARGS", "navigate needs url");
 							const loaded = await tab.navigate(a.url);
-							return done({ loaded }, `navigated to ${a.url}${loaded ? "" : " (still loading)"}`);
+							return done({ route: "cdp-page", loaded }, `navigated to ${a.url}${loaded ? "" : " (still loading)"}`);
 						}
 						case "back":
-						case "forward":
+						case "forward": {
+							const r = await tab.history(a.op === "back" ? -1 : 1);
+							return done({ route: "cdp-page", loaded: r.loaded }, `${a.op}: ${r.url}${r.loaded ? "" : " (still loading)"}`);
+						}
 						case "reload": {
-							if (a.op === "reload") await tab.send("Page.reload");
-							else await tab.eval(`history.${a.op}()`);
-							const loaded = await tab.waitForLoad();
-							return done({ loaded }, `${a.op}: ${(await tab.info()).url}`);
+							const loaded = await tab.reload();
+							return done({ route: "cdp-page", loaded }, `reloaded${loaded ? "" : " (still loading)"}`);
 						}
 						case "click":
 						case "hover": {
@@ -150,12 +156,13 @@ export function pageTools(ctx: Ctx): Tool[] {
 						}
 						case "fill": {
 							if (!a.ref && !a.selector) throw new ToolError("BAD_ARGS", "fill needs ref or selector");
+							if (typeof a.text !== "string") throw new ToolError("BAD_ARGS", 'fill needs text (text "" clears the field)');
 							const p = await target(tab, a);
 							const id = await tab.objectId(p.backend!, a.ref ?? a.selector);
 							await tab.callOn(id, "function(){ this.focus(); if (this.select) this.select(); else { const r = document.createRange(); r.selectNodeContents(this); const s = getSelection(); s.removeAllRanges(); s.addRange(r); } }");
-							const text = String(a.text ?? "");
+							const text: string = a.text;
 							if (text) await tab.send("Input.insertText", { text });
-							else await tab.key("Backspace");
+							else await tab.key(parseKey("Backspace"));
 							const value = String(await tab.callOn(id, "function(){ return this.value ?? this.innerText }"));
 							return done({ route: "cdp-input", verified: value === text, value: value.slice(0, 2000) }, `field is now ${JSON.stringify(value.slice(0, 200))}`);
 						}
@@ -164,41 +171,60 @@ export function pageTools(ctx: Ctx): Tool[] {
 							await tab.send("Input.insertText", { text: a.text });
 							return done({}, `inserted ${a.text.length} chars`);
 						case "press": {
-							const keys: string[] = a.keys ?? (a.text ? [a.text] : []);
+							const keys: string[] = a.keys ?? [];
 							if (!keys.length) throw new ToolError("BAD_ARGS", "press needs keys");
-							for (const k of keys) await tab.key(k);
+							const parsed = keys.map(parseKey); // all valid before the first is sent
+							for (const k of parsed) await tab.key(k);
 							return done({}, `pressed ${keys.join(" ")}`);
 						}
 						case "select": {
-							if (a.value === undefined) throw new ToolError("BAD_ARGS", "select needs value");
+							if (typeof a.value !== "string") throw new ToolError("BAD_ARGS", "select needs value");
 							const backend = a.ref ? await ctx.browser.node(tab, a.ref) : a.selector ? await tab.select(a.selector) : undefined;
 							if (!backend) throw new ToolError("BAD_ARGS", "select needs ref or selector");
 							const id = await tab.objectId(backend, a.ref ?? a.selector);
-							const value = await tab.callOn(
+							// Checks come back as {error} before anything changes; a failure after that is not a refusal.
+							const r = await tab.callOn(
 								id,
-								`function(v){ if (this.tagName !== "SELECT") throw new Error("not a <select>"); const o = [...this.options].find(o => o.value === v) ?? [...this.options].find(o => o.label.trim() === v); if (!o) throw new Error("no option " + v); this.value = o.value; this.dispatchEvent(new Event("input", {bubbles: true})); this.dispatchEvent(new Event("change", {bubbles: true})); return this.value }`,
+								`function(v){ if (this.tagName !== "SELECT") return { error: "not a <select>" }; const o = [...this.options].find(o => o.value === v) ?? [...this.options].find(o => o.label.trim() === v); if (!o) return { error: "no option " + JSON.stringify(v) }; const wanted = o.value; this.value = wanted; this.dispatchEvent(new Event("input", {bubbles: true})); this.dispatchEvent(new Event("change", {bubbles: true})); return { wanted, value: this.value } }`,
 								[a.value],
-							).catch((e: Error) => {
-								throw new ToolError("BAD_ARGS", e.message.split("\n")[0]);
-							});
-							return done({ route: "cdp-dom", verified: true, value }, `selected ${value}`);
+							);
+							if (r.error) throw new ToolError("BAD_ARGS", r.error);
+							const verified = r.value === r.wanted;
+							return done({ route: "cdp-dom", verified, value: r.value }, `selected ${r.value}${verified ? "" : ` (wanted ${r.wanted}: a change handler reset it?)`}`);
 						}
 						case "scroll": {
 							if (!a.dx && !a.dy) throw new ToolError("BAD_ARGS", "give dx and/or dy");
-							const p = a.ref || a.selector || a.x !== undefined ? await target(tab, a) : await target(tab, {}, false);
-							const before = await tab.viewport();
-							await tab.wheel(p.x, p.y, a.dx ?? 0, a.dy ?? 0);
+							const dx = Number(a.dx ?? 0);
+							const dy = Number(a.dy ?? 0);
+							if (!(a.ref || a.selector || a.x !== undefined)) {
+								const pos = (await tab.eval(`(() => { scrollBy({ left: ${dx}, top: ${dy}, behavior: "instant" }); return [scrollX, scrollY] })()`)) as [number, number];
+								return done({ route: "cdp-dom", scroll: { x: pos[0], y: pos[1] }, scroller: "document" }, `document scrolled to ${pos[0]},${pos[1]}`);
+							}
+							const p = await target(tab, a);
+							// Scroll chaining means any scrollable ancestor of the point (or the document) may move: watch them all and
+							// report the one that did.
+							const found = await tab.send("Runtime.evaluate", {
+								expression: `(() => { const out = []; for (let n = document.elementFromPoint(${p.x}, ${p.y}); n && n !== document.body && n !== document.documentElement; n = n.parentElement) { const s = getComputedStyle(n); if (/(auto|scroll|overlay)/.test(s.overflowX + s.overflowY) && (n.scrollHeight > n.clientHeight || n.scrollWidth > n.clientWidth)) out.push(n) } out.push(document.scrollingElement); return out })()`,
+							});
+							const chain = found.result.objectId as string;
+							const read = async () => (await tab.callOn(chain, "function(){ return this.map(e => [e.scrollLeft, e.scrollTop]) }")) as [number, number][];
+							const same = (x: [number, number][], y: [number, number][]) => x.every((v, i) => v[0] === y[i][0] && v[1] === y[i][1]);
+							const before = await read();
+							await tab.wheel(p.x, p.y, dx, dy);
 							// Wheel scrolling animates: report where it settles (or the last position after ~1 s).
 							let last = before;
 							for (let i = 0; i < 10; i++) {
 								await new Promise((r) => setTimeout(r, 100));
-								const now = await tab.viewport();
-								if (now.scrollX === last.scrollX && now.scrollY === last.scrollY && (i > 1 || now.scrollY !== before.scrollY || now.scrollX !== before.scrollX)) break;
+								const now = await read();
+								if (same(now, last) && (i > 1 || !same(now, before))) break;
 								last = now;
 							}
-							const scroll = { x: last.scrollX, y: last.scrollY };
-							const moved = scroll.x !== before.scrollX || scroll.y !== before.scrollY;
-							return done({ at: { x: p.x, y: p.y }, scroll, verified: moved }, `scrolled to ${scroll.x},${scroll.y}${moved ? "" : " (did not move: at the edge, or the target does not scroll)"}`);
+							const movedAt = last.findIndex((v, i) => v[0] !== before[i][0] || v[1] !== before[i][1]);
+							const at = movedAt >= 0 ? movedAt : 0;
+							const scroller = at === last.length - 1 ? "document" : "element";
+							const scroll = { x: last[at][0], y: last[at][1] };
+							const moved = movedAt >= 0;
+							return done({ at: { x: p.x, y: p.y }, scroll, scroller, verified: moved }, `${scroller} scrolled to ${scroll.x},${scroll.y}${moved ? "" : " (nothing moved: at its edge?)"}`);
 						}
 						default:
 							throw new ToolError("BAD_ARGS", `unknown op ${a.op}`);
@@ -227,10 +253,13 @@ export function pageTools(ctx: Ctx): Tool[] {
 			outputSchema: out({ captureId: str(), scale: num("image px per CSS px"), viewport: out({ width: int(), height: int(), scrollX: num(), scrollY: num() }) }, ["captureId", "scale", "viewport"]),
 			async run(raw) {
 				const tab = await ctx.browser.tab(String(raw.tab));
+				// The capture is only valid for the document it shows: refuse to issue an id if the page changed meanwhile.
+				const loaderId = await tab.loaderId();
 				const shot = await tab.screenshot((raw.maxEdge as number) || DEFAULT_MAX_EDGE);
+				if ((await tab.loaderId()) !== loaderId) throw new ToolError("PAGE_CHANGED", "the page navigated while the screenshot was taken; take it again");
 				const id = `s${++pageShots}.${ctx.gen}`;
 				if (ctx.pageCaptures.size >= 32) ctx.pageCaptures.delete(ctx.pageCaptures.keys().next().value!);
-				ctx.pageCaptures.set(id, { id, targetId: tab.targetId, scale: shot.scale, scrollX: shot.scrollX, scrollY: shot.scrollY, width: shot.width, height: shot.height });
+				ctx.pageCaptures.set(id, { id, targetId: tab.targetId, loaderId, scale: shot.scale, image: shot.image, scrollX: shot.scrollX, scrollY: shot.scrollY, width: shot.width, height: shot.height });
 				const viewport = { width: shot.width, height: shot.height, scrollX: shot.scrollX, scrollY: shot.scrollY };
 				return ok({ captureId: id, scale: shot.scale, viewport }, `${id}: viewport ${shot.width}x${shot.height} at scale ${shot.scale.toFixed(3)}`, { data: shot.data, mimeType: "image/jpeg" });
 			},

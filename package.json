@@ -1,6 +1,6 @@
 {
   "name": "pi-computer-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "MCP server for the pi-desktop computer (AT-SPI desktop apps, shared Chromium over CDP, screenshots)",

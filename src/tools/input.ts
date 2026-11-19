@@ -60,7 +60,7 @@ export function inputTools(ctx: Ctx): Tool[] {
 		{
 			name: "move",
 			kind: "action",
-			description: "Move the mouse pointer (hover) to a ref, screenshot point or screen point.",
+			description: "Move the mouse pointer (hover) to a ref, screenshot point or screen point. window is not checked here (moving is what the check itself does); hover can still open menus or tooltips.",
 			inputSchema: obj(POINT),
 			outputSchema: receipt({ at: AT }),
 			run: (raw, signal) =>
@@ -99,7 +99,7 @@ export function inputTools(ctx: Ctx): Tool[] {
 		{
 			name: "scroll",
 			kind: "action",
-			description: "Mouse wheel at a point (or wherever the pointer is): dy > 0 scrolls down, dx > 0 right, in wheel clicks (typically ~3 lines each).",
+			description: "Mouse wheel at a point (or wherever the pointer is): dy > 0 scrolls down, dx > 0 right, in wheel clicks (typically ~3 lines each). With window and no point, refused when another window is under the pointer.",
 			inputSchema: obj({ ...POINT, dx: int(), dy: int(), modifiers: MODS }),
 			outputSchema: receipt({ at: AT }),
 			run: (raw, signal) =>
@@ -110,6 +110,7 @@ export function inputTools(ctx: Ctx): Tool[] {
 					if (!dx && !dy) throw new ToolError("BAD_ARGS", "give dx and/or dy");
 					const p = a.ref || a.x !== undefined ? await resolvePoint(ctx, a) : undefined;
 					if (p) await checkLanding(p);
+					else if (a.window) await checkLanding({ ...(await x11.pointer()), window: x11.normId(a.window) });
 					await x11.scroll(p, dx, dy, { modifiers: raw.modifiers as string[], signal });
 					return ok({ outcome: "delivered", route: "xtest", ...(p ? { at: { x: p.x, y: p.y } } : {}) }, `scrolled ${dx},${dy}`);
 				}),
@@ -122,11 +123,10 @@ export function inputTools(ctx: Ctx): Tool[] {
 			outputSchema: receipt(),
 			run: (raw, signal) =>
 				ctx.queue.run(signal, async () => {
-					const a = dropEmpty(raw, ["window"]) as { keys: string[] | string; repeat?: number; window?: string };
-					const keys = typeof a.keys === "string" ? a.keys.split(/\s+/).filter(Boolean) : a.keys;
+					const a = dropEmpty(raw, ["window"]) as { keys: string[]; repeat?: number; window?: string };
 					await checkActive(a.window);
-					await x11.keys(keys, a.repeat ?? 1, signal);
-					return ok({ outcome: "delivered", route: "xtest" }, `pressed ${keys.join(" ")}`);
+					await x11.keys(a.keys, a.repeat ?? 1, signal);
+					return ok({ outcome: "delivered", route: "xtest" }, `pressed ${a.keys.join(" ")}`);
 				}),
 		},
 		{

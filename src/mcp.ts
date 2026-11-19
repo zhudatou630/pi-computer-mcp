@@ -59,6 +59,7 @@ type Message = { jsonrpc?: string; id?: string | number | null; method?: string;
 export function createServer(info: ServerInfo) {
 	const tools = new Map(info.tools.map((t) => [t.name, t]));
 	const running = new Map<string | number, AbortController>();
+	let stopped = false;
 
 	/** The response to one message, or undefined for notifications and responses. */
 	async function handle(msg: Message): Promise<object | undefined> {
@@ -94,6 +95,7 @@ export function createServer(info: ServerInfo) {
 			case "tools/call": {
 				const tool = tools.get(params?.name);
 				if (!tool) return fail(-32602, `unknown tool: ${params?.name}`);
+				if (stopped) return reply(errorResult(tool, new ToolError("SHUTTING_DOWN", "the server is shutting down")));
 				const controller = new AbortController();
 				running.set(id, controller);
 				try {
@@ -109,7 +111,13 @@ export function createServer(info: ServerInfo) {
 		}
 	}
 
-	return { handle };
+	/** Refuse new calls and cancel running ones (on shutdown, so gestures release their buttons and keys). */
+	const stop = () => {
+		stopped = true;
+		for (const c of running.values()) c.abort();
+	};
+
+	return { handle, stop };
 }
 
 /** Serve on stdin/stdout. Requests run concurrently; input tools serialize themselves through the input queue. */
