@@ -48,7 +48,7 @@ AT-SPI 走桌面用户的 D-Bus 会话总线，这条总线只接受属主本人
 
 系统依赖：`xdotool`、`scrot`、`xprop`、`xwininfo`、`wmctrl`（apt 装的，用来礼貌地关闭窗口和最大化/还原；本机的 xdotool 是 2016 版，没有 `windowquit`/`windowstate`）。
 
-验证连接：`pi mcp list`。改了代码后，在会话里执行 `/mcp reconnect computer`；当前会话缓存的工具清单不会自动更新（server 不发 list_changed）。
+验证连接：`pi mcp list`。部署新版本后，在会话里执行 `/mcp reconnect computer`；当前会话缓存的工具清单不会自动更新（server 不发 list_changed）。
 
 ## 设计决定与踩过的坑
 
@@ -77,6 +77,8 @@ AT-SPI 走桌面用户的 D-Bus 会话总线，这条总线只接受属主本人
 - `screenshot` 拍的是屏幕上可见的像素，窗口被遮住的部分拍到的是上面的窗口。
 - 未在真实桌面上测过改分辨率（会影响正在看 VNC 的人），屏幕尺寸变化的拒绝逻辑只有单元测试。
 
-## 测试
+## 开发与测试
 
-`npm test`：协议、窗口解析、坐标换算、窗口与 AT-SPI 对应、队列取消、按键解析、树过滤。桌面和浏览器相关部分只能在真实桌面上手动验证。
+`npm run check`：tsc 类型检查加单元测试（协议、窗口解析、坐标换算、窗口与 AT-SPI 对应、AT-SPI 遍历、队列取消、按键解析、树过滤、history 时序）。桌面和浏览器相关部分只能在真实桌面上手动验证。
+
+开发在 `/opt/pi-computer-mcp-dev`，运行在 `/opt/pi-computer-mcp`，通过 GitHub 部署（`git pull --ff-only`）；流程、实测方法和约束见 [`AGENTS.md`](AGENTS.md)。

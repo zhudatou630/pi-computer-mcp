@@ -5,10 +5,15 @@
   "type": "module",
   "description": "MCP server for the pi-desktop computer (AT-SPI desktop apps, shared Chromium over CDP, screenshots)",
   "scripts": {
-    "test": "node --test 'test/**/*.test.ts'"
+    "test": "node --test 'test/**/*.test.ts'",
+    "check": "tsc -p tsconfig.json && npm test"
   },
   "license": "MIT",
   "dependencies": {
     "dbus-next": "0.10.2"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "typescript": "5.9.3"
   }
 }
