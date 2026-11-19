@@ -40,12 +40,13 @@ export async function rootForWindow(ctx: Ctx, id: string) {
 	const [{ windows }, { roots, unreadablePids }] = await Promise.all([x11.listWindows(), ctx.atspi.roots()]);
 	const win = windows.find((w) => w.id === x11.normId(id));
 	if (!win) throw new ToolError("WINDOW_GONE", `window ${id} no longer exists; call windows`);
+	// With part of the app's roots unread, the missing one may be the right match: no pairing is trustworthy yet.
+	if (win.pid && unreadablePids.includes(win.pid)) throw new ToolError("APP_BUSY", `the app of window ${win.id} did not answer; try again`);
 	const m = matchRoots([win, ...windows.filter((w) => w.id !== win.id && w.pid === win.pid)], roots).get(win.id)!;
 	if (!m.root) {
 		const candidates = m.candidates.map((r) => ({ ref: r.ref, role: r.role, name: r.name }));
 		if (candidates.length)
 			throw new ToolError("AMBIGUOUS", `window ${win.id} cannot be told apart from its app's other windows (same title and place); activate it or move it (window op=activate/move), then observe again`, { details: { candidates } });
-		if (win.pid && unreadablePids.includes(win.pid)) throw new ToolError("APP_BUSY", `the app of window ${win.id} did not answer; try again`);
 		throw new ToolError("NO_ACCESSIBLE_ROOT", `window ${win.id} (${win.class}) has no accessibility tree (app started before AT-SPI, Electron, or no a11y support); use screenshot + pointer input`);
 	}
 	ctx.atspi.bindWindow(m.root.ref, win.id);

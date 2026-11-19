@@ -33,8 +33,9 @@ export function desktopTools(ctx: Ctx): Tool[] {
 					const pairs = matchRoots(windows, roots);
 					list = list.map((w) => {
 						const m = pairs.get(w.id)!;
+						if (w.pid && unreadablePids.includes(w.pid)) return { ...w, accessible: "busy" }; // part of its app's roots unread
 						if (m.root) ctx.atspi.bindWindow(m.root.ref, w.id);
-						return { ...w, accessible: m.root ? m.root.ref : m.candidates.length ? "ambiguous" : w.pid && unreadablePids.includes(w.pid) ? "busy" : "none" };
+						return { ...w, accessible: m.root ? m.root.ref : m.candidates.length ? "ambiguous" : "none" };
 					});
 				}
 				const text = [`screen ${screen.width}x${screen.height}, active ${active ?? "none"}`, ...list.map((w) => `${w.id} ${w.class || w.instance} ${JSON.stringify(w.title)} @${w.x},${w.y} ${w.width}x${w.height}${w.active ? " [active]" : ""}${w.hidden ? " [hidden]" : ""}${"accessible" in w ? ` a11y=${(w as any).accessible}` : ""}`)].join("\n");
