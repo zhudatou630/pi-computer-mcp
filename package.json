@@ -1,0 +1,14 @@
+{
+  "name": "pi-computer-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server for the pi-desktop computer (AT-SPI desktop apps, shared Chromium over CDP, screenshots)",
+  "scripts": {
+    "test": "node --test 'test/**/*.test.ts'"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "dbus-next": "0.10.2"
+  }
+}
