@@ -15,7 +15,7 @@ const modBits = (mods?: string[]) => (mods ?? []).reduce((b, m) => b | ({ alt: 1
 export function pageTools(ctx: Ctx): Tool[] {
 	let pageShots = 0;
 	/** Target element -> viewport point, refusing when something else would receive the click. */
-	async function target(tab: Tab, a: { ref?: string; selector?: string; x?: number; y?: number; captureId?: string }, needElement = true): Promise<{ x: number; y: number; backend?: number }> {
+	async function target(tab: Tab, a: { ref?: string; selector?: string; x?: number; y?: number; captureId?: string }): Promise<{ x: number; y: number; backend?: number }> {
 		if (a.ref || a.selector) {
 			const label = a.ref ?? a.selector!;
 			const backend = a.ref ? await ctx.browser.node(tab, a.ref) : await tab.select(a.selector!);
@@ -23,11 +23,7 @@ export function pageTools(ctx: Ctx): Tool[] {
 			if (!(await tab.hits(c.x, c.y, backend, label))) throw new ToolError("OCCLUDED", `${label} is covered by another element at its centre (a dialog, banner or overlay?)`, { details: { at: c } });
 			return { ...c, backend };
 		}
-		if (a.x === undefined || a.y === undefined) {
-			if (needElement) throw new ToolError("BAD_ARGS", "give ref, selector, or x and y");
-			const v = await tab.viewport();
-			return { x: v.width / 2, y: v.height / 2 };
-		}
+		if (a.x === undefined || a.y === undefined) throw new ToolError("BAD_ARGS", "give ref, selector, or x and y");
 		if (a.captureId) {
 			const c = ctx.pageCaptures.get(a.captureId);
 			if (!c || c.targetId !== tab.targetId) throw new ToolError("CAPTURE_STALE", `unknown page capture ${a.captureId} for this tab; take a new page_screenshot`);
@@ -185,12 +181,12 @@ export function pageTools(ctx: Ctx): Tool[] {
 							// Checks come back as {error} before anything changes; a failure after that is not a refusal.
 							const r = await tab.callOn(
 								id,
-								`function(v){ if (this.tagName !== "SELECT") return { error: "not a <select>" }; const o = [...this.options].find(o => o.value === v) ?? [...this.options].find(o => o.label.trim() === v); if (!o) return { error: "no option " + JSON.stringify(v) }; const wanted = o.value; this.selectedIndex = o.index; this.dispatchEvent(new Event("input", {bubbles: true})); this.dispatchEvent(new Event("change", {bubbles: true})); return { ok: this.options[this.selectedIndex] === o && o.value === wanted, value: this.value } }`,
+								`function(v){ if (this.tagName !== "SELECT") return { error: "not a <select>" }; const o = [...this.options].find(o => o.value === v) ?? [...this.options].find(o => o.label.trim() === v); if (!o) return { error: "no option " + JSON.stringify(v) }; const wanted = o.value; this.selectedIndex = o.index; this.dispatchEvent(new Event("input", {bubbles: true})); this.dispatchEvent(new Event("change", {bubbles: true})); return { ok: this.isConnected && this.options[this.selectedIndex] === o && o.value === wanted, value: this.value } }`,
 								[a.value],
 							);
 							if (r.error) throw new ToolError("BAD_ARGS", r.error);
-							// Set by index (options can share a value, .value picks the first); verified: that very option is still
-							// selected with the value it had, after the page's handlers ran.
+							// Set by index (options can share a value, .value picks the first); verified: the <select> is still on the
+							// page and that very option is still selected with the value it had, after the page's handlers ran.
 							const verified = r.ok === true;
 							return done({ route: "cdp-dom", verified, value: r.value }, `selected ${r.value}${verified ? "" : " (a different option is selected now: a change handler reset it?)"}`);
 						}
@@ -198,7 +194,8 @@ export function pageTools(ctx: Ctx): Tool[] {
 							if (!a.dx && !a.dy) throw new ToolError("BAD_ARGS", "give dx and/or dy");
 							const dx = Number(a.dx ?? 0);
 							const dy = Number(a.dy ?? 0);
-							if (!(a.ref || a.selector || a.x !== undefined)) {
+							// Any target argument means a target: a half-given point is an error, not a document scroll.
+							if (!(a.ref || a.selector || a.captureId || a.x !== undefined || a.y !== undefined)) {
 								const pos = (await tab.eval(`(() => { scrollBy({ left: ${dx}, top: ${dy}, behavior: "instant" }); return [scrollX, scrollY] })()`)) as [number, number];
 								return done({ route: "cdp-dom", scroll: { x: pos[0], y: pos[1] }, scroller: "document" }, `document scrolled to ${pos[0]},${pos[1]}`);
 							}
@@ -221,26 +218,31 @@ export function pageTools(ctx: Ctx): Tool[] {
 								? await tab.send("Runtime.callFunctionOn", { objectId: await tab.objectId(p.backend, a.ref ?? a.selector), functionDeclaration: chainFn, arguments: args })
 								: await tab.send("Runtime.evaluate", { expression: `(${chainFn}).call(null, ${p.x}, ${p.y})` });
 							const chain = found.result.objectId as string;
-							type Pos = [x: number, y: number, isDocument: boolean];
-							const read = async () => (await tab.callOn(chain, "function(){ return this.map(e => [e.scrollLeft, e.scrollTop, e === document.scrollingElement]) }")) as Pos[];
-							const same = (x: Pos[], y: Pos[]) => x.every((v, i) => v[0] === y[i][0] && v[1] === y[i][1]);
-							const before = await read();
-							await tab.wheel(p.x, p.y, dx, dy);
-							if (!before.length) return done({ at: { x: p.x, y: p.y } }, "wheel sent (nothing scrollable found to measure)");
-							// Wheel scrolling animates: report where it settles (or the last position after ~1 s).
-							let last = before;
-							for (let i = 0; i < 10; i++) {
-								await new Promise((r) => setTimeout(r, 100));
-								const now = await read();
-								if (same(now, last) && (i > 1 || !same(now, before))) break;
-								last = now;
+							try {
+								type Pos = [x: number, y: number, isDocument: boolean];
+								const read = async () => (await tab.callOn(chain, "function(){ return this.map(e => [e.scrollLeft, e.scrollTop, e === document.scrollingElement]) }")) as Pos[];
+								const same = (x: Pos[], y: Pos[]) => x.every((v, i) => v[0] === y[i][0] && v[1] === y[i][1]);
+								const before = await read();
+								await tab.wheel(p.x, p.y, dx, dy);
+								if (!before.length) return done({ at: { x: p.x, y: p.y } }, "wheel sent (nothing scrollable found to measure)");
+								// Wheel scrolling animates: report where it settles (or the last position after ~1 s).
+								let last = before;
+								for (let i = 0; i < 10; i++) {
+									await new Promise((r) => setTimeout(r, 100));
+									const now = await read();
+									if (same(now, last) && (i > 1 || !same(now, before))) break;
+									last = now;
+								}
+								const movedAt = last.findIndex((v, i) => v[0] !== before[i][0] || v[1] !== before[i][1]);
+								const at = movedAt >= 0 ? movedAt : 0;
+								const scroller = last[at][2] ? "document" : "element";
+								const scroll = { x: last[at][0], y: last[at][1] };
+								const moved = movedAt >= 0;
+								return done({ at: { x: p.x, y: p.y }, scroll, scroller, verified: moved }, `${scroller} scrolled to ${scroll.x},${scroll.y}${moved ? "" : " (nothing moved: at its edge?)"}`);
+							} finally {
+								// The array holds page elements: let them go once measured.
+								await tab.send("Runtime.releaseObject", { objectId: chain }).catch(() => {});
 							}
-							const movedAt = last.findIndex((v, i) => v[0] !== before[i][0] || v[1] !== before[i][1]);
-							const at = movedAt >= 0 ? movedAt : 0;
-							const scroller = last[at][2] ? "document" : "element";
-							const scroll = { x: last[at][0], y: last[at][1] };
-							const moved = movedAt >= 0;
-							return done({ at: { x: p.x, y: p.y }, scroll, scroller, verified: moved }, `${scroller} scrolled to ${scroll.x},${scroll.y}${moved ? "" : " (nothing moved: at its edge?)"}`);
 						}
 						default:
 							throw new ToolError("BAD_ARGS", `unknown op ${a.op}`);

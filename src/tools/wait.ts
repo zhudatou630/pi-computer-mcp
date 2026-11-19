@@ -39,13 +39,13 @@ export function waitTool(ctx: Ctx): Tool {
 		if (a.text) throw new ToolError("BAD_ARGS", "element waits filter with query (substring of role, name or value) or name (exact), not text");
 		const onlyRef = a.ref && !isFiltered(a);
 		if (onlyRef) {
-			// The element itself: alive or gone. A busy app proves neither, so it matches nothing and the wait goes on.
+			// The element itself: alive or gone. An unknown ref (never observed by this process) was not read at all, so it
+			// is an error, not "gone"; APP_BUSY is handled by the caller like any element wait.
 			const alive = await ctx.atspi.check(a.ref!).then(
 				() => true,
-				// An unknown ref (never observed by this process) was not read at all: an error, not "gone".
-				(e) => (e instanceof ToolError && e.code === "STALE_REF" && e.details.reason !== "unknown" ? false : e instanceof ToolError && e.code === "APP_BUSY" ? undefined : Promise.reject(e)),
+				(e) => (e instanceof ToolError && e.code === "STALE_REF" && e.details.reason !== "unknown" ? false : Promise.reject(e)),
 			);
-			return { matched: alive !== undefined && (a.gone ? !alive : alive), value: { alive: alive ?? "unknown", complete: alive !== undefined } };
+			return { matched: a.gone ? !alive : alive, value: { alive, complete: true } };
 		}
 		const limits = { maxDepth: 32, maxNodes: 2000, keep: "onScreen" as const };
 		let result;

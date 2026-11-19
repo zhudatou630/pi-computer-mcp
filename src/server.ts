@@ -44,11 +44,14 @@ Contract:
 Example (codemode):
 const c = "mcp__computer__";
 const l = await tools[c+"launch"]({ command: "mousepad" });
+if (l.isError) return l.structuredContent;
 const w = await tools[c+"wait"]({ condition: "window", class: "mousepad", exclude: l.structuredContent.existingWindows, timeoutMs: 8000 });
+if (w.isError) return w.structuredContent;
 if (!w.structuredContent.matched) return "no new window (a running instance may have opened a tab instead)";
 const win = w.structuredContent.result.matches[0].id;
 const o = await tools[c+"observe"]({ window: win, role: "text" });
 if (o.isError) return o.structuredContent;
+if (!o.structuredContent.nodes.length) return "no text field found";
 const r = await tools[c+"set_text"]({ ref: o.structuredContent.nodes[0].ref, text: "你好" });
 return r.structuredContent;`;
 

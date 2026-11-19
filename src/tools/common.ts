@@ -41,7 +41,7 @@ export async function rootForWindow(ctx: Ctx, id: string) {
 	const win = windows.find((w) => w.id === x11.normId(id));
 	if (!win) throw new ToolError("WINDOW_GONE", `window ${id} no longer exists; call windows`);
 	// With part of the app's roots unread, the missing one may be the right match: no pairing is trustworthy yet.
-	if (win.pid && unreadablePids.includes(win.pid)) throw new ToolError("APP_BUSY", `the app of window ${win.id} did not answer; try again`);
+	if (win.pid && unreadablePids.includes(win.pid)) throw new ToolError("APP_BUSY", `the accessibility tree of window ${win.id}'s app could not be fully read (busy, or more than 50 top-level windows); try again`);
 	const m = matchRoots([win, ...windows.filter((w) => w.id !== win.id && w.pid === win.pid)], roots).get(win.id)!;
 	if (!m.root) {
 		const candidates = m.candidates.map((r) => ({ ref: r.ref, role: r.role, name: r.name }));

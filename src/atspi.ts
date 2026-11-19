@@ -222,7 +222,8 @@ export class Atspi {
 	}
 
 	/**
-	 * Top-level frames and dialogs of every app, plus the pids whose list may be incomplete (the app did not answer),
+	 * Top-level frames and dialogs of every app, plus the pids whose list may be incomplete (the app did not answer, or
+	 * has more than 50 top-levels),
 	 * so a missing root there means "unknown", not "none".
 	 */
 	async roots(): Promise<{ roots: Root[]; unreadablePids: number[] }> {
@@ -233,9 +234,9 @@ export class Atspi {
 			(await this.apps()).map(async (app) => {
 				if (app.unreadable) return void incomplete(app);
 				const [kids] = await this.#call(app.o, ACC, "GetChildren").catch((e) => (readFailure(e) !== "gone" && incomplete(app), [[]]));
-				if (kids.length > 50) incomplete(app);
+				if (kids.length > 50) return void incomplete(app); // its windows cannot be paired anyway: skip the reads
 				await Promise.all(
-					(kids as [string, string][]).slice(0, 50).map(async ([dest, path]) => {
+					(kids as [string, string][]).map(async ([dest, path]) => {
 						const o = { dest, path };
 						const [role, name, states, box] = await Promise.all([
 							this.#call(o, ACC, "GetRoleName").then((r) => String(r[0]), (e) => (readFailure(e) !== "gone" && incomplete(app), "")),
@@ -261,9 +262,10 @@ export class Atspi {
 		const apps = await this.apps();
 		const needle = name.toLowerCase();
 		const exact = apps.filter((a) => a.name.toLowerCase() === needle);
-		const matches = exact.length ? exact : apps.filter((a) => a.name && a.name.toLowerCase().includes(needle));
 		const unreadable = apps.filter((a) => a.unreadable).length;
-		if (!matches.length && unreadable) throw new ToolError("APP_BUSY", `no app matching "${name}" among those that answered; ${unreadable} could not be read`);
+		// An unread name may be the exact one: then neither a substring match nor absence can be trusted.
+		if (!exact.length && unreadable) throw new ToolError("APP_BUSY", `no app named exactly "${name}" among those that answered; ${unreadable} could not be read, try again`);
+		const matches = exact.length ? exact : apps.filter((a) => a.name.toLowerCase().includes(needle));
 		if (!matches.length) throw new ToolError("NOT_FOUND", `no accessible app matching "${name}"`, { details: { apps: apps.map((a) => a.name) } });
 		if (matches.length > 1) throw new ToolError("AMBIGUOUS", `${matches.length} apps match "${name}"`, { details: { candidates: matches.map((a) => a.name) } });
 		return { ref: this.#ref(matches[0].o, "application"), name: matches[0].name, o: matches[0].o };

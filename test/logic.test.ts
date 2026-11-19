@@ -159,6 +159,21 @@ test("walk keeps unnamed on-screen containers only in onScreen mode", async () =
 	assert.deepEqual([hidden.nodes.length, hidden.root?.role], [0, "dialog"]);
 });
 
+test("appObj: an unread app name blocks substring matches and absence", async () => {
+	const atspi = new Atspi("g2");
+	const app = (name: string, unreadable = false) => ({ name, o: { dest: name || "?", path: "/" }, ...(unreadable ? { unreadable: true } : {}) });
+	let apps = [app("Image Editor"), app("", true)];
+	(atspi as any).apps = async () => apps;
+	// the unread one may be "Editor" itself: no guess, no "not found"
+	await assert.rejects(atspi.appObj("Editor"), (e: any) => e.code === "APP_BUSY");
+	await assert.rejects(atspi.appObj("Nothing"), (e: any) => e.code === "APP_BUSY");
+	assert.equal((await atspi.appObj("Image Editor")).name, "Image Editor"); // an exact name still works
+	apps = [app("Image Editor")];
+	assert.equal((await atspi.appObj("Editor")).name, "Image Editor");
+	await assert.rejects(atspi.appObj("Nothing"), (e: any) => e.code === "NOT_FOUND");
+	atspi.close();
+});
+
 test("a ref this process never observed is stale without any read (not proof that it is gone)", async () => {
 	const atspi = new Atspi("g1");
 	await assert.rejects(atspi.check("a1.zz9"), (e: any) => e.code === "STALE_REF" && e.details.reason === "unknown");
@@ -178,18 +193,18 @@ test("readFailure: only error replies that prove absence mean gone", () => {
 test("history reports loaded only for the selected entry's complete document", async () => {
 	// The old page stays complete; the back navigation commits during the first history check after the request,
 	// and the new document stays loading for a few reads.
-	const st = { index: 1, loader: "L1", href: "http://x/b", ready: "complete", requested: false, checks: 0, reads: 0 };
+	const st = { index: 1, loader: "L1", ready: "complete", requested: false, checks: 0, reads: 0 };
 	const fake = {
 		send: async (method: string) => {
 			if (method === "Page.getNavigationHistory") {
-				if (st.requested && ++st.checks === 2) Object.assign(st, { index: 0, loader: "L0", href: "http://x/a", ready: "loading" });
+				if (st.requested && ++st.checks === 2) Object.assign(st, { index: 0, loader: "L0", ready: "loading" });
 				return { currentIndex: st.index, entries: [{ id: 10, url: "http://x/a" }, { id: 11, url: "http://x/b" }] };
 			}
 			if (method === "Page.navigateToHistoryEntry") return void (st.requested = true);
 			if (method === "Page.getFrameTree") return { frameTree: { frame: { loaderId: st.loader } } };
 			if (method === "Runtime.evaluate") {
 				if (st.loader === "L0" && ++st.reads === 3) st.ready = "complete";
-				return { result: { value: [st.href, st.ready] } };
+				return { result: { value: st.ready } };
 			}
 			throw new Error(method);
 		},

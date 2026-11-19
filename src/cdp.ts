@@ -192,12 +192,12 @@ export class Tab {
 		return (await this.send("Page.getFrameTree")).frameTree.frame.loaderId;
 	}
 
-	/** The main frame's document, read so that loader, URL and readyState belong together (undefined mid-navigation). */
-	async #snapshot(): Promise<{ loaderId: string; href: string; ready: string } | undefined> {
+	/** The main frame's document, read so that loader and readyState belong together (undefined mid-navigation). */
+	async #snapshot(): Promise<{ loaderId: string; ready: string } | undefined> {
 		try {
 			const loaderId = await this.loaderId();
-			const [href, ready] = (await this.eval("[location.href, document.readyState]")) as [string, string];
-			return (await this.loaderId()) === loaderId ? { loaderId, href, ready } : undefined;
+			const ready = String(await this.eval("document.readyState"));
+			return (await this.loaderId()) === loaderId ? { loaderId, ready } : undefined;
 		} catch {
 			return undefined;
 		}
@@ -207,7 +207,7 @@ export class Tab {
 	 * Poll until the main frame's document is complete and satisfies `done`; false on timeout. `committed` (optional) must
 	 * hold before the snapshot is taken and still after, so the snapshot is of the document it vouches for.
 	 */
-	async waitFor(done: (s: { loaderId: string; href: string }) => boolean, timeoutMs = 10_000, committed?: () => Promise<boolean>) {
+	async waitFor(done: (s: { loaderId: string }) => boolean, timeoutMs = 10_000, committed?: () => Promise<boolean>) {
 		const end = Date.now() + timeoutMs;
 		while (Date.now() < end) {
 			if (!committed || (await committed())) {
@@ -345,8 +345,8 @@ export class Browser {
 	#owned = new Set<string>();
 	/** Attaches in flight, so parallel calls share one session. */
 	#attaching = new Map<string, Promise<Tab>>();
-	/** Sessions Chromium ended, so an attach that was still setting one up does not cache it. */
-	#detached = new Set<string>();
+	/** Sessions being set up; Chromium ending one removes it, so the attach does not cache a dead session. */
+	#settingUp = new Set<string>();
 	#gen: string;
 	#n = 0;
 	#refs = new Map<string, { targetId: string; loaderId: string; backendId: number }>();
@@ -365,7 +365,7 @@ export class Browser {
 		if ((!existing || existing.closed) && this.#cdp === current) {
 			this.#cdp = connect(this.httpUrl).then((c) => {
 				c.onDetached = (sessionId) => {
-					this.#detached.add(sessionId);
+					this.#settingUp.delete(sessionId);
 					for (const [id, tab] of this.#tabs) if (tab.sessionId === sessionId) this.#tabs.delete(id);
 				};
 				return c;
@@ -405,14 +405,21 @@ export class Browser {
 		const cdp = await this.#connection();
 		const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
 		const tab = new Tab(cdp, targetId, sessionId, owned);
-		await tab.send("Page.enable");
-		// A background tab is "hidden": Chromium stops rendering it, and input that needs a frame (wheel, hover, link
-		// navigation) stalls. Focus emulation makes it render as visible without switching the person's tab.
-		await tab.send("Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
-		await tab.send("Page.setWebLifecycleState", { state: "active" }).catch(() => {});
+		this.#settingUp.add(sessionId);
+		try {
+			await tab.send("Page.enable");
+			// A background tab is "hidden": Chromium stops rendering it, and input that needs a frame (wheel, hover, link
+			// navigation) stalls. Focus emulation makes it render as visible without switching the person's tab.
+			await tab.send("Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
+			await tab.send("Page.setWebLifecycleState", { state: "active" }).catch(() => {});
+		} catch (e) {
+			this.#settingUp.delete(sessionId);
+			throw e;
+		}
 		// The connection or the session may have died meanwhile: never cache a dead session.
+		const alive = this.#settingUp.delete(sessionId);
 		if (cdp.closed) throw new Error("CDP connection closed while attaching");
-		if (this.#detached.delete(sessionId)) throw new Error(`Chromium ended the session for ${targetId} while attaching`);
+		if (!alive) throw new Error(`Chromium ended the session for ${targetId} while attaching`);
 		this.#tabs.set(targetId, tab);
 		return tab;
 	}
@@ -451,8 +458,12 @@ export class Browser {
 		const tab = this.#tabs.get(targetId);
 		if (!tab && !this.#owned.has(targetId)) throw new ToolError("NOT_ATTACHED", `tab ${targetId} is not one of yours; open a tab, or attach to it explicitly`);
 		if (!(await this.#exists(targetId))) throw new ToolError("TARGET_GONE", `tab ${targetId} was closed`);
-		// A tab this process opened, after the connection was replaced: attach again.
-		return tab ?? (await this.#attach(targetId, true));
+		// Read the cache again: the session may have ended while the check ran.
+		const live = this.#tabs.get(targetId);
+		if (live) return live;
+		if (!this.#owned.has(targetId)) throw new ToolError("NOT_ATTACHED", `the session for tab ${targetId} ended; attach to it again`);
+		// A tab this process opened, after the connection was replaced or its session ended: attach again.
+		return this.#attach(targetId, true);
 	}
 
 	async close(targetId: string) {
