@@ -80,5 +80,3 @@ AT-SPI 走桌面用户的 D-Bus 会话总线，这条总线只接受属主本人
 ## 开发与测试
 
 `npm run check`：tsc 类型检查加单元测试（协议、窗口解析、坐标换算、窗口与 AT-SPI 对应、AT-SPI 遍历、队列取消、按键解析、树过滤、history 时序）。桌面和浏览器相关部分只能在真实桌面上手动验证。
-
-开发在 `/opt/pi-computer-mcp-dev`，运行在 `/opt/pi-computer-mcp`，通过 GitHub 部署（`git pull --ff-only`）；流程、实测方法和约束见 [`AGENTS.md`](AGENTS.md)。
