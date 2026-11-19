@@ -31,7 +31,7 @@ export const RECEIPT = {
 };
 export const receipt = (extra: Record<string, S> = {}) => out({ ...RECEIPT, ...extra }, ["outcome"]);
 
-export const windowParam = str('X window id ("0x…") from windows. Pointer actions then refuse if another window is under the pointer; key/type refuse unless it is the active window.');
+export const windowParam = str('X window id ("0x…") from windows. Pointer actions (not move) then refuse if another app window is under the pointer (menus and popups are allowed); key/type refuse unless it is the active window.');
 
 // ---- targets ----
 

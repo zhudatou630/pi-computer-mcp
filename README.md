@@ -16,7 +16,7 @@
 
 - 数据在 `structuredContent`；失败时 `isError: true`，`structuredContent` 里有 `outcome`、`code`、`message`。参数不符合 schema（多余或缺少字段）时，pi 客户端直接让调用 throw，不会走到 server。
 - `outcome`：`delivered` 已发出（不代表已生效）；`refused` 动作确定没发出（窗口检查可能已经移动了指针）；`unknown` 可能已发出，不要盲目重试。能真正核实时才给 `verified`，核实不了就不给。
-- 动作不自动回读、不等效果，例外：`window` 会确认操作结果（最多 2 秒，给 `verified`）；页面的 navigate/back/forward/reload 会等到对应文档加载完（`loaded`）；页面 scroll 等滚动停下。下一步依赖结果时接 `wait` 或 `observe`。
+- 动作不自动回读、不等效果，例外：`window` 会确认操作结果（最多 2 秒，给 `verified`）；页面的 navigate/back/forward/reload 会等到对应文档加载完（`loaded`）；页面 scroll 等滚动停下。只改 hash 的页内跳转没有新文档，`loaded` 只表示文档已完成，不核对页面是否保留了那个 hash。下一步依赖结果时接 `wait` 或 `observe`。
 - `wait gone` 只认“确认不存在”：只有 D-Bus 明确回复对象或服务不存在（`UnknownObject`、`ServiceUnknown`）才算元素消失；应用忙（`APP_BUSY`）、其他读取错误、导航途中读不到页面，都不算。按 `query` 匹配时，输入框的值只看前 500 个字符。
 - 0.3.0 的不兼容变化：`wait` 等元素时用 `query`（子串）/ `name`（精确），不再接受 `text`（`text` 只用于页面）；`window move` 的 x,y 改为客户区坐标；页面 `fill` 必须给 `text`；自己开的标签页不能 detach，要 close。
 - 过期的 ref 一律拒绝（`STALE_REF`），不会改绑到同名的新元素；ref 和 captureId 带进程代际，server 重启后旧 id 明确失效。
@@ -61,7 +61,7 @@ AT-SPI 走桌面用户的 D-Bus 会话总线，这条总线只接受属主本人
 - **`type` 的换行**：xdotool 把 `\n` 打成 Linefeed，GTK 不认，所以按行拆开、中间发 Return。
 - **Chromium 后台标签页不渲染**：滚轮、悬停、截图会卡住。所以自己开的标签页放在独立的浏览器窗口里（不抢焦点），并开启焦点模拟（`Emulation.setFocusEmulationEnabled`），窗口被最小化时也能操作。接管来的后台标签页截图会超时重试一次。
 - **页面点击前做命中检测**：元素中心被别的元素盖住时拒绝（`OCCLUDED`）。用页面里的 `elementFromPoint`（视口坐标，和输入事件一致）；`DOM.getNodeForLocation` 不考虑滚动，页面一滚动就会误判。命中检测沿渲染树走：进入开放的 shadow root，以及目标自己所在的封闭 shadow root（从目标能拿到它），slot 里的元素经 slot 往上找。
-- **页面滚动的回执**：滚轮会沿滚动链传给外层，所以同时观察命中点沿渲染树（shadow root、slot）的所有可滚动祖先和 document（包括自己滚动的 body），报告实际动了的那个（`scroller`）；不给目标时直接滚 document。
+- **页面滚动的回执**：滚轮会沿滚动链传给外层，所以同时观察命中点沿渲染树（shadow root、slot）的所有可滚动祖先和 document（包括自己滚动的 body），报告实际动了的那个（`scroller`）；不给目标时直接滚 document。只给坐标时看不进封闭 shadow root，那里的滚动会报 `verified:false`。
 - **自己开的标签页的归属**：单独记一份 target id，CDP 断线重连后仍能操作和关闭，server 退出时关掉。Chromium 主动结束 session（如标签页崩溃）时丢弃缓存的 session，下次使用时重新附着；并行调用共用同一次附着。
 - **页面截图坐标**：`captureId` 只对同一文档、同一滚动位置和视口有效，导航后拒绝（`CAPTURE_STALE`）。
 - **退出时先取消正在执行的输入**：拖拽、按住等手势被取消后会松开按键，再关浏览器标签页。

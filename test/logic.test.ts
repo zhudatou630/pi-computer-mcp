@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { AtspiTimeout, matchRoots, readFailure, stateNames, walk, type Obj, type RawNode, type Root } from "../src/atspi.ts";
+import { Atspi, AtspiTimeout, matchRoots, readFailure, stateNames, walk, type Obj, type RawNode, type Root } from "../src/atspi.ts";
 import { checkFresh, plan, toScreen, type Capture } from "../src/capture.ts";
 import { axToNodes, parseKey, Tab } from "../src/cdp.ts";
 import { InputQueue, poll } from "../src/queue.ts";
 import { filterNodes, formatTree, type UiNode } from "../src/tree.ts";
-import { interpolate, isTypeable, parseWindows, xpropString } from "../src/x11.ts";
+import { interpolate, isTypeable, parseWindows, typeSteps, xpropString } from "../src/x11.ts";
 
 test("parseWindows reads xprop/xwininfo output, topmost first", () => {
 	const text = `1920 1080
@@ -154,6 +154,15 @@ test("walk keeps unnamed on-screen containers only in onScreen mode", async () =
 	const roles = async (keep: "default" | "onScreen") => (await walk({ dest: "d", path: "/root" }, read, (o) => o.path, { maxDepth: 8, maxNodes: 100, keep })).nodes.map((n) => n.role);
 	assert.deepEqual(await roles("default"), ["frame", "filler", "dialog"]); // top two levels always listed
 	assert.deepEqual(await roles("onScreen"), ["frame", "filler", "tree table"]); // filters: only on-screen nodes below the scope
+	// a hidden scope matches no filter, but is still reported as the root
+	const hidden = await walk({ dest: "d", path: "/hidden" }, read, (o) => o.path, { maxDepth: 8, maxNodes: 100, keep: "onScreen" });
+	assert.deepEqual([hidden.nodes.length, hidden.root?.role], [0, "dialog"]);
+});
+
+test("a ref this process never observed is stale without any read (not proof that it is gone)", async () => {
+	const atspi = new Atspi("g1");
+	await assert.rejects(atspi.check("a1.zz9"), (e: any) => e.code === "STALE_REF" && e.details.reason === "unknown");
+	atspi.close();
 });
 
 test("readFailure: only error replies that prove absence mean gone", () => {
@@ -236,6 +245,12 @@ test("drag paths are interpolated; typing is ASCII only", () => {
 	assert.deepEqual(pts.map((p) => p.x), [0, 25, 50, 75, 100]);
 	assert.equal(isTypeable("hello\tworld\n"), true);
 	assert.equal(isTypeable("你好"), false);
+	// lines are joined by Return; anything after a Return is preceded by a focus check
+	assert.deepEqual(typeSteps("a\nb"), [{ text: "a" }, { key: "Return" }, { check: true }, { text: "b" }]);
+	assert.deepEqual(typeSteps("a\n\nb"), [{ text: "a" }, { key: "Return" }, { check: true }, { key: "Return" }, { check: true }, { text: "b" }]);
+	assert.deepEqual(typeSteps("a\n"), [{ text: "a" }, { key: "Return" }]);
+	assert.deepEqual(typeSteps("\nx"), [{ key: "Return" }, { check: true }, { text: "x" }]);
+	assert.deepEqual(typeSteps("plain"), [{ text: "plain" }]);
 });
 
 test("parseKey builds CDP key events", () => {

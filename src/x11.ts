@@ -276,16 +276,31 @@ export async function hold(chord: string, ms: number, signal?: AbortSignal) {
 
 export const isTypeable = (text: string) => /^[\x20-\x7E\n\t]*$/.test(text);
 
-/** `beforeLine` runs before each line after a Return (which may have moved focus); it can stop the typing by throwing. */
-export async function type(text: string, signal?: AbortSignal, beforeLine?: () => Promise<void>) {
-	// xdotool types "\n" as Linefeed, which GTK ignores: send Return between lines instead.
-	const lines = text.split("\n");
-	for (let i = 0; i < lines.length; i++) {
-		if (i) {
-			await gesture(signal, [], [], ["key", "--clearmodifiers", "Return"]);
-			if (lines[i] && beforeLine) await beforeLine();
-		}
+export type TypeStep = { text: string } | { key: "Return" } | { check: true };
+
+/**
+ * What typing `text` sends. xdotool types "\n" as Linefeed, which GTK ignores, so lines are separated by Return. A Return
+ * may move focus (it can close a dialog): any event after one is preceded by a check.
+ */
+export function typeSteps(text: string): TypeStep[] {
+	const steps: TypeStep[] = [];
+	const push = (s: TypeStep) => {
+		if (steps.at(-1) && "key" in steps.at(-1)!) steps.push({ check: true });
+		steps.push(s);
+	};
+	text.split("\n").forEach((line, i) => {
+		if (i) push({ key: "Return" });
+		if (line) push({ text: line });
+	});
+	return steps;
+}
+
+/** `check` runs where typeSteps puts a check; it can stop the typing by throwing. */
+export async function type(text: string, signal?: AbortSignal, check?: () => Promise<void>) {
+	for (const step of typeSteps(text)) {
+		if ("check" in step) await check?.();
+		else if ("key" in step) await gesture(signal, [], [], ["key", "--clearmodifiers", "Return"]);
 		// via stdin: text starting with "-" would otherwise be parsed as an option
-		if (lines[i]) await gesture(signal, [], [], ["type", "--clearmodifiers", "--delay", "12", "--file", "-"], lines[i]);
+		else await gesture(signal, [], [], ["type", "--clearmodifiers", "--delay", "12", "--file", "-"], step.text);
 	}
 }

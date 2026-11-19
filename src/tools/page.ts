@@ -1,6 +1,6 @@
 // Web pages in the shared Chromium over CDP: only tabs this process opened or was told to attach to.
 import { DEFAULT_MAX_EDGE } from "../capture.ts";
-import { isPageInteractive, axToNodes, parseKey, type Tab } from "../cdp.ts";
+import { isPageInteractive, axToNodes, PAGE_HELPERS, parseKey, type Tab } from "../cdp.ts";
 import { dropEmpty, ok, ToolError, type Tool } from "../mcp.ts";
 import { filterNodes, formatTree, isFiltered } from "../tree.ts";
 import { arr, bool, type Ctx, enm, int, num, obj, out, receipt, str } from "./common.ts";
@@ -100,10 +100,10 @@ export function pageTools(ctx: Ctx): Tool[] {
 			kind: "action",
 			description: [
 				"One action in your tab, with real input events where it matters.",
-				"navigate(url) | back | forward | reload — wait for load (loaded=false if it timed out).",
+				"navigate(url) | back | forward | reload — wait for load (loaded=false if it timed out; for a hash-only change, loaded only says the document is complete, not that the page kept that hash).",
 				"click(target, button?, count?, modifiers?) | hover(target) — at the element's centre after scrolling it into view; refused (OCCLUDED) if something covers it.",
 				"fill(target, text) replaces a field's text (any language; text \"\" clears it), verified by reading the value back. type(text) inserts at the focus. press(keys) e.g. [\"Enter\"], [\"Control+a\"]; xdotool names (Return, ctrl+a, Down) work too. All keys are checked before any is sent.",
-				"select(target, value) picks an <option> by value or label. scroll(target?, dx?, dy?) in CSS px: with a target, wheel there and report the scroll position of the element that scrolls; without one, scroll the document.",
+				"select(target, value) picks an <option> by value or label. scroll(target?, dx?, dy?) in CSS px: with a target, wheel there and report the scroll position of the element that scrolls (at bare x,y, scrollers inside closed shadow roots cannot be seen: verified may be false); without one, scroll the document.",
 				"target = ref (from page_observe) | selector (CSS, must match exactly one) | x,y (viewport CSS px, or image px with captureId).",
 			].join("\n"),
 			inputSchema: obj(
@@ -185,12 +185,13 @@ export function pageTools(ctx: Ctx): Tool[] {
 							// Checks come back as {error} before anything changes; a failure after that is not a refusal.
 							const r = await tab.callOn(
 								id,
-								`function(v){ if (this.tagName !== "SELECT") return { error: "not a <select>" }; const o = [...this.options].find(o => o.value === v) ?? [...this.options].find(o => o.label.trim() === v); if (!o) return { error: "no option " + JSON.stringify(v) }; const wanted = o.index; this.selectedIndex = wanted; this.dispatchEvent(new Event("input", {bubbles: true})); this.dispatchEvent(new Event("change", {bubbles: true})); return { wanted, index: this.selectedIndex, value: this.value } }`,
+								`function(v){ if (this.tagName !== "SELECT") return { error: "not a <select>" }; const o = [...this.options].find(o => o.value === v) ?? [...this.options].find(o => o.label.trim() === v); if (!o) return { error: "no option " + JSON.stringify(v) }; const wanted = o.value; this.selectedIndex = o.index; this.dispatchEvent(new Event("input", {bubbles: true})); this.dispatchEvent(new Event("change", {bubbles: true})); return { ok: this.options[this.selectedIndex] === o && o.value === wanted, value: this.value } }`,
 								[a.value],
 							);
 							if (r.error) throw new ToolError("BAD_ARGS", r.error);
-							// By index: options can share a value, and setting .value picks the first of them.
-							const verified = r.index === r.wanted;
+							// Set by index (options can share a value, .value picks the first); verified: that very option is still
+							// selected with the value it had, after the page's handlers ran.
+							const verified = r.ok === true;
 							return done({ route: "cdp-dom", verified, value: r.value }, `selected ${r.value}${verified ? "" : " (a different option is selected now: a change handler reset it?)"}`);
 						}
 						case "scroll": {
@@ -203,27 +204,29 @@ export function pageTools(ctx: Ctx): Tool[] {
 							}
 							const p = await target(tab, a);
 							// Scroll chaining means any scrollable ancestor of the point (or the document) may move: watch them all and
-							// report the one that did.
-							const found = await tab.send("Runtime.evaluate", {
-								// Same descent as the hit test: into open shadow roots, then up the composed ancestors (slots, hosts).
-								expression: `(() => {
-									const x = ${p.x}, y = ${p.y}, doc = document.scrollingElement, out = [];
-									let hit = document.elementFromPoint(x, y);
-									while (hit && hit.shadowRoot) { const inner = hit.shadowRoot.elementFromPoint(x, y); if (!inner || inner === hit) break; hit = inner; }
-									for (let n = hit; n; n = n.assignedSlot || n.parentNode || n.host) {
-										if (n.nodeType !== 1 || n === doc) continue;
-										const s = getComputedStyle(n);
-										if (/(auto|scroll|overlay)/.test(s.overflowX + s.overflowY) && (n.scrollHeight > n.clientHeight || n.scrollWidth > n.clientWidth)) out.push(n);
-									}
-									if (doc) out.push(doc);
-									return out;
-								})()`,
-							});
+							// report the one that did. Same hit as the occlusion check (shadow roots, slots).
+							const chainFn = `function(x, y){ ${PAGE_HELPERS}
+								const t = this && this.nodeType ? (this.nodeType === 1 ? this : this.parentElement) : null;
+								const doc = document.scrollingElement, out = [];
+								for (let n = deepHit(x, y, t); n; n = composedParent(n)) {
+									if (n.nodeType !== 1 || n === doc) continue;
+									const s = getComputedStyle(n);
+									if (/(auto|scroll|overlay)/.test(s.overflowX + s.overflowY) && (n.scrollHeight > n.clientHeight || n.scrollWidth > n.clientWidth)) out.push(n);
+								}
+								if (doc) out.push(doc);
+								return out;
+							}`;
+							const args = [{ value: p.x }, { value: p.y }];
+							const found = p.backend
+								? await tab.send("Runtime.callFunctionOn", { objectId: await tab.objectId(p.backend, a.ref ?? a.selector), functionDeclaration: chainFn, arguments: args })
+								: await tab.send("Runtime.evaluate", { expression: `(${chainFn}).call(null, ${p.x}, ${p.y})` });
 							const chain = found.result.objectId as string;
-							const read = async () => (await tab.callOn(chain, "function(){ return this.map(e => [e.scrollLeft, e.scrollTop]) }")) as [number, number][];
-							const same = (x: [number, number][], y: [number, number][]) => x.every((v, i) => v[0] === y[i][0] && v[1] === y[i][1]);
+							type Pos = [x: number, y: number, isDocument: boolean];
+							const read = async () => (await tab.callOn(chain, "function(){ return this.map(e => [e.scrollLeft, e.scrollTop, e === document.scrollingElement]) }")) as Pos[];
+							const same = (x: Pos[], y: Pos[]) => x.every((v, i) => v[0] === y[i][0] && v[1] === y[i][1]);
 							const before = await read();
 							await tab.wheel(p.x, p.y, dx, dy);
+							if (!before.length) return done({ at: { x: p.x, y: p.y } }, "wheel sent (nothing scrollable found to measure)");
 							// Wheel scrolling animates: report where it settles (or the last position after ~1 s).
 							let last = before;
 							for (let i = 0; i < 10; i++) {
@@ -234,7 +237,7 @@ export function pageTools(ctx: Ctx): Tool[] {
 							}
 							const movedAt = last.findIndex((v, i) => v[0] !== before[i][0] || v[1] !== before[i][1]);
 							const at = movedAt >= 0 ? movedAt : 0;
-							const scroller = at === last.length - 1 ? "document" : "element";
+							const scroller = last[at][2] ? "document" : "element";
 							const scroll = { x: last[at][0], y: last[at][1] };
 							const moved = movedAt >= 0;
 							return done({ at: { x: p.x, y: p.y }, scroll, scroller, verified: moved }, `${scroller} scrolled to ${scroll.x},${scroll.y}${moved ? "" : " (nothing moved: at its edge?)"}`);

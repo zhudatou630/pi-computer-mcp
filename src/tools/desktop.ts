@@ -117,7 +117,7 @@ export function desktopTools(ctx: Ctx): Tool[] {
 				window: str('X window id ("0x…")'),
 				app: str("App name as AT-SPI reports it (exact, else unique substring)"),
 				ref: str("Observe the subtree under this element"),
-				query: str("Keep nodes whose role, name or value contains this (case-insensitive)"),
+				query: str("Keep nodes whose role, name or value contains this (case-insensitive; a field's value is read up to 500 characters)"),
 				role: str('Keep nodes with exactly this AT-SPI role name, e.g. "button", "toggle button", "menu item", "table cell", "text", "label"'),
 				name: str("Keep nodes with exactly this name"),
 				states: arr(str(), 'Keep nodes having all these states, e.g. ["focused"], ["selected"]'),
@@ -144,7 +144,7 @@ export function desktopTools(ctx: Ctx): Tool[] {
 					result = await ctx.atspi.observe(app.o, limits);
 				} else {
 					result = await ctx.atspi.observeRef(a.ref, limits);
-					const top = result.nodes[0];
+					const top = result.root;
 					root = { ref: a.ref, role: top?.role ?? "", name: top?.name ?? "", ...(ctx.atspi.windowOf(a.ref) ? { window: ctx.atspi.windowOf(a.ref) } : {}) };
 				}
 				const nodes: UiNode[] = filtered ? filterNodes(result.nodes, a, isInteractive) : result.nodes;

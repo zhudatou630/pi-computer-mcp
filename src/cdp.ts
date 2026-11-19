@@ -144,6 +144,25 @@ export function parseKey(spec: string) {
 
 // ---- tabs ----
 
+/**
+ * Page-side helpers, pasted into functions run in the page. deepHit: the element at viewport (x,y) as rendered, descending
+ * into open shadow roots and into the closed ones on t's own path (t can reach them; the document cannot).
+ * composedParent: the rendered parent (slotted nodes go up through their slot, shadow roots to their host).
+ */
+export const PAGE_HELPERS = `
+	function deepHit(x, y, t) {
+		const roots = new Map();
+		for (let root = t && t.getRootNode(); root instanceof ShadowRoot; root = root.host.getRootNode()) roots.set(root.host, root);
+		let hit = document.elementFromPoint(x, y);
+		for (;;) {
+			const sr = hit && (hit.shadowRoot || roots.get(hit));
+			const inner = sr && sr.elementFromPoint(x, y);
+			if (!inner || inner === hit) return hit;
+			hit = inner;
+		}
+	}
+	function composedParent(n) { return n.assignedSlot || n.parentNode || n.host; }`;
+
 /** A page screenshot's coordinate contract: valid for this document, scroll position and viewport only. */
 export type PageCapture = { id: string; targetId: string; loaderId: string; scale: number; image: { width: number; height: number }; scrollX: number; scrollY: number; width: number; height: number };
 
@@ -267,23 +286,12 @@ export class Tab {
 	/** Is the element at (x,y) the target or inside it? Otherwise something covers it. */
 	async hits(x: number, y: number, backendNodeId: number, ref: string): Promise<boolean> {
 		const target = await this.objectId(backendNodeId, ref);
-		// elementFromPoint takes viewport px like Input events (DOM.getNodeForLocation ignores scrolling). Descend into shadow
-		// roots (open ones, and closed ones on the target's own path, which the target can reach), then walk the composed
-		// (rendered) ancestors: slotted nodes up through their slot, shadow roots to their host.
+		// elementFromPoint takes viewport px like Input events (DOM.getNodeForLocation ignores scrolling).
 		return this.callOn(
 			target,
-			`function(x, y){
+			`function(x, y){ ${PAGE_HELPERS}
 				const t = this.nodeType === 1 ? this : this.parentElement;
-				const roots = new Map();
-				for (let root = t && t.getRootNode(); root instanceof ShadowRoot; root = root.host.getRootNode()) roots.set(root.host, root);
-				let hit = document.elementFromPoint(x, y);
-				for (;;) {
-					const sr = hit && (hit.shadowRoot || roots.get(hit));
-					const inner = sr && sr.elementFromPoint(x, y);
-					if (!inner || inner === hit) break;
-					hit = inner;
-				}
-				for (let n = hit; n; n = n.assignedSlot || n.parentNode || n.host) if (n === t) return true;
+				for (let n = deepHit(x, y, t); n; n = composedParent(n)) if (n === t) return true;
 				return false;
 			}`,
 			[x, y],
@@ -337,6 +345,8 @@ export class Browser {
 	#owned = new Set<string>();
 	/** Attaches in flight, so parallel calls share one session. */
 	#attaching = new Map<string, Promise<Tab>>();
+	/** Sessions Chromium ended, so an attach that was still setting one up does not cache it. */
+	#detached = new Set<string>();
 	#gen: string;
 	#n = 0;
 	#refs = new Map<string, { targetId: string; loaderId: string; backendId: number }>();
@@ -355,6 +365,7 @@ export class Browser {
 		if ((!existing || existing.closed) && this.#cdp === current) {
 			this.#cdp = connect(this.httpUrl).then((c) => {
 				c.onDetached = (sessionId) => {
+					this.#detached.add(sessionId);
 					for (const [id, tab] of this.#tabs) if (tab.sessionId === sessionId) this.#tabs.delete(id);
 				};
 				return c;
@@ -381,6 +392,8 @@ export class Browser {
 	}
 
 	#attach(targetId: string, owned: boolean): Promise<Tab> {
+		const cached = this.#tabs.get(targetId); // another call may have finished attaching meanwhile
+		if (cached) return Promise.resolve(cached);
 		const pending = this.#attaching.get(targetId);
 		if (pending) return pending;
 		const p = this.#attachNow(targetId, owned).finally(() => this.#attaching.delete(targetId));
@@ -397,8 +410,9 @@ export class Browser {
 		// navigation) stalls. Focus emulation makes it render as visible without switching the person's tab.
 		await tab.send("Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
 		await tab.send("Page.setWebLifecycleState", { state: "active" }).catch(() => {});
-		// The connection may have died meanwhile: never cache a session of a dead connection.
+		// The connection or the session may have died meanwhile: never cache a dead session.
 		if (cdp.closed) throw new Error("CDP connection closed while attaching");
+		if (this.#detached.delete(sessionId)) throw new Error(`Chromium ended the session for ${targetId} while attaching`);
 		this.#tabs.set(targetId, tab);
 		return tab;
 	}

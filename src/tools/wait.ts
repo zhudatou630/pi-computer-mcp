@@ -42,7 +42,8 @@ export function waitTool(ctx: Ctx): Tool {
 			// The element itself: alive or gone. A busy app proves neither, so it matches nothing and the wait goes on.
 			const alive = await ctx.atspi.check(a.ref!).then(
 				() => true,
-				(e) => (e instanceof ToolError && e.code === "STALE_REF" ? false : e instanceof ToolError && e.code === "APP_BUSY" ? undefined : Promise.reject(e)),
+				// An unknown ref (never observed by this process) was not read at all: an error, not "gone".
+				(e) => (e instanceof ToolError && e.code === "STALE_REF" && e.details.reason !== "unknown" ? false : e instanceof ToolError && e.code === "APP_BUSY" ? undefined : Promise.reject(e)),
 			);
 			return { matched: alive !== undefined && (a.gone ? !alive : alive), value: { alive: alive ?? "unknown", complete: alive !== undefined } };
 		}

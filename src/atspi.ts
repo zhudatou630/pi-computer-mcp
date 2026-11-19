@@ -66,8 +66,9 @@ const onScreen = (box?: Box) => box !== undefined && box[2] > 1 && box[3] > 1 &&
  * Breadth-first walk from `root`, reading at most maxNodes elements; when the budget runs out the elements read so far
  * are kept. GTK often leaves SHOWING unset, so an on-screen box is the visibility signal. The top two levels are always kept.
  */
-export async function walk(root: Obj, read: (o: Obj) => Promise<RawNode>, refOf: (o: Obj, role: string) => string, options: WalkOptions): Promise<{ nodes: UiNode[]; coverage: Coverage }> {
+export async function walk(root: Obj, read: (o: Obj) => Promise<RawNode>, refOf: (o: Obj, role: string) => string, options: WalkOptions): Promise<{ root?: UiNode; nodes: UiNode[]; coverage: Coverage }> {
 	const nodes: UiNode[] = [];
+	let rootNode: UiNode | undefined;
 	const coverage: Coverage = { complete: true, visited: 0, errors: 0 };
 	let attempted = 0;
 	let level = [{ o: root, depth: 0 }];
@@ -96,10 +97,11 @@ export async function walk(root: Obj, read: (o: Obj) => Promise<RawNode>, refOf:
 				if (visible) node.box = n.box;
 				if (isInteractive(node) && !n.statesUnknown && !n.states.includes("sensitive")) node.states = [...node.states, "disabled"];
 				const unnamedCell = n.role === "table cell" && !n.name;
-				// The scope itself is always listed; the default view also lists the level below it (frames, dialogs),
-				// filters only what is on screen.
+				if (n.depth === 0) rootNode = node;
+				// The default view always lists the scope and the level below it (frames, dialogs); filters only what is on
+				// screen, the scope included.
 				const keep = options.keep === "onScreen" ? visible : visible && (!!n.name || isInteractive(node)) && !unnamedCell;
-				if (n.depth === 0 || (n.depth === 1 && options.keep !== "onScreen") || keep) nodes.push(node);
+				if ((n.depth <= 1 && options.keep !== "onScreen") || keep) nodes.push(node);
 				// Walk into off-screen containers too: GTK keeps real buttons inside 1x1 boxes.
 				if (n.depth < options.maxDepth) for (const o of n.kids) next.push({ o, depth: n.depth + 1 });
 				else if (n.kids.length) coverage.truncatedBy ??= "maxDepth";
@@ -108,7 +110,7 @@ export async function walk(root: Obj, read: (o: Obj) => Promise<RawNode>, refOf:
 		level = next;
 	}
 	coverage.complete = !coverage.truncatedBy && coverage.errors === 0;
-	return { nodes, coverage };
+	return { ...(rootNode ? { root: rootNode } : {}), nodes, coverage };
 }
 
 export class Atspi {
@@ -132,6 +134,9 @@ export class Atspi {
 					const bus = dbus.sessionBus({ busAddress: address });
 					bus.on("error", () => (this.#bus = undefined));
 					return bus;
+				} catch (e) {
+					// A plain error on purpose: "no a11y bus" must not read as "this element is gone".
+					throw new Error(`AT-SPI bus unavailable: ${(e as Error).message}`);
 				} finally {
 					session.disconnect();
 				}
@@ -182,7 +187,8 @@ export class Atspi {
 		const rec = this.#refs.get(ref);
 		if (!rec) {
 			const other = /^a\d+\.(.+)$/.exec(ref)?.[1];
-			throw new ToolError("STALE_REF", other && other !== this.#gen ? `${ref} is from a previous server process; observe again` : `unknown ref ${ref}; observe first`);
+			// reason "unknown": nothing was read, so this says nothing about whether the element still exists.
+			throw new ToolError("STALE_REF", other && other !== this.#gen ? `${ref} is from a previous server process; observe again` : `unknown ref ${ref}; observe first`, { details: { reason: "unknown" } });
 		}
 		const [role, state] = await Promise.all([
 			this.#call(rec.o, ACC, "GetRoleName").then((r) => String(r[0])),
@@ -227,11 +233,12 @@ export class Atspi {
 			(await this.apps()).map(async (app) => {
 				if (app.unreadable) return void incomplete(app);
 				const [kids] = await this.#call(app.o, ACC, "GetChildren").catch((e) => (readFailure(e) !== "gone" && incomplete(app), [[]]));
+				if (kids.length > 50) incomplete(app);
 				await Promise.all(
 					(kids as [string, string][]).slice(0, 50).map(async ([dest, path]) => {
 						const o = { dest, path };
 						const [role, name, states, box] = await Promise.all([
-							this.#call(o, ACC, "GetRoleName").then((r) => String(r[0]), () => ""),
+							this.#call(o, ACC, "GetRoleName").then((r) => String(r[0]), (e) => (readFailure(e) !== "gone" && incomplete(app), "")),
 							this.#prop(o, ACC, "Name").then((v) => String(v).trim(), () => ""),
 							this.#call(o, ACC, "GetState").then((r) => stateNames(r[0]), () => [] as string[]),
 							this.#call(o, COMP, "GetExtents", "u", [0]).then((r) => r[0] as Box, () => undefined),
@@ -293,7 +300,7 @@ export class Atspi {
 		return { text: String(text), length: count, truncated: count > max };
 	}
 
-	async observe(root: Obj, options: WalkOptions & { window?: string }): Promise<{ nodes: UiNode[]; coverage: Coverage }> {
+	async observe(root: Obj, options: WalkOptions & { window?: string }): ReturnType<typeof walk> {
 		return walk(root, (o) => this.#node(o), (o, role) => this.#ref(o, role, options.window), options);
 	}
 

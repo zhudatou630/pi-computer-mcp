@@ -146,7 +146,7 @@ export function inputTools(ctx: Ctx): Tool[] {
 		{
 			name: "type",
 			kind: "action",
-			description: "Type ASCII text as keystrokes into the focused window (\\n = Enter, \\t = Tab). With window, focus is checked before typing and, 300 ms after each Enter, before the next line (best effort: if an Enter may close a dialog, send the lines as separate calls with a wait between); a stop after some lines is outcome unknown. Other text (Chinese, emoji, accents) is refused before anything is sent: use set_text on the element, or page_act fill/type in a page.",
+			description: "Type ASCII text as keystrokes into the focused window (\\n = Enter, \\t = Tab). With window, focus is checked before typing and, 300 ms after each Enter, before anything that follows it (best effort: if an Enter may close a dialog, send the lines as separate calls with a wait between); a stop after some lines is outcome unknown. Other text (Chinese, emoji, accents) is refused before anything is sent: use set_text on the element, or page_act fill/type in a page.",
 			inputSchema: obj({ text: str(), window: windowParam }, ["text"]),
 			outputSchema: receipt(),
 			run: (raw, signal) =>
