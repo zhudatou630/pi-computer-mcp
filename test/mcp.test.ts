@@ -1,22 +1,19 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createServer, dropEmpty, type Tool } from "../src/mcp.ts";
+import { createServer, dropEmpty, ok, ToolError, type Tool } from "../src/mcp.ts";
 
-const echo: Tool = {
-	name: "echo",
-	description: "echo",
-	inputSchema: { type: "object" },
-	annotations: { readOnlyHint: true },
-	run: async (args) => ({ content: [{ type: "text", text: String(args.text) }] }),
-};
-const boom: Tool = { name: "boom", description: "fails", inputSchema: { type: "object" }, run: async () => { throw new Error("nope"); } };
+const echo: Tool = { name: "echo", kind: "read", description: "echo", inputSchema: { type: "object" }, outputSchema: { type: "object" }, run: async (args) => ok({ text: args.text }, String(args.text)) };
+const refuse: Tool = { name: "refuse", kind: "action", description: "", inputSchema: { type: "object" }, run: async () => { throw new ToolError("STALE_REF", "gone", { details: { ref: "a1" } }); } };
+const crash: Tool = { name: "crash", kind: "action", description: "", inputSchema: { type: "object" }, run: async () => { throw new Error("boom"); } };
 const slow: Tool = {
 	name: "slow",
+	kind: "read",
 	description: "waits until cancelled",
 	inputSchema: { type: "object" },
-	run: (_args, signal) => new Promise((_, reject) => signal.addEventListener("abort", () => reject(new Error("cancelled")))),
+	run: (_args, signal) => new Promise((_, reject) => signal.addEventListener("abort", () => reject(new ToolError("CANCELLED", "cancelled")))),
 };
-const server = createServer({ name: "t", version: "1", instructions: "hi", tools: [echo, boom, slow] });
+const server = createServer({ name: "t", version: "1", instructions: "hi", tools: [echo, refuse, crash, slow] });
+const call = (name: string, args = {}, id = 1): Promise<any> => server.handle({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }) as any;
 
 test("initialize echoes the client's protocol version and offers tools", async () => {
 	const r: any = await server.handle({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26" } });
@@ -31,28 +28,37 @@ test("notifications get no reply; unknown methods get -32601", async () => {
 	assert.equal(r.error.code, -32601);
 });
 
-test("tools/list and tools/call", async () => {
-	const list: any = await server.handle({ jsonrpc: "2.0", id: 3, method: "tools/list" });
-	assert.deepEqual(list.result.tools.map((t: any) => t.name), ["echo", "boom", "slow"]);
-	assert.deepEqual(list.result.tools[0].annotations, { readOnlyHint: true });
-	const call: any = await server.handle({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "echo", arguments: { text: "x" } } });
-	assert.deepEqual(call.result, { content: [{ type: "text", text: "x" }] });
+test("tools/list carries output schemas and read/action hints", async () => {
+	const r: any = await server.handle({ jsonrpc: "2.0", id: 3, method: "tools/list" });
+	const [e, f] = r.result.tools;
+	assert.deepEqual(e.outputSchema, { type: "object" });
+	assert.equal(e.annotations.readOnlyHint, true);
+	assert.equal(f.annotations.readOnlyHint, false);
+	assert.equal(f.outputSchema, undefined);
 });
 
-test("a failing tool is a tool error, an unknown tool a protocol error", async () => {
-	const failed: any = await server.handle({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "boom" } });
-	assert.equal(failed.result.isError, true);
-	assert.equal(failed.result.content[0].text, "nope");
-	const unknown: any = await server.handle({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "nope" } });
+test("results carry structuredContent", async () => {
+	const r = await call("echo", { text: "x" });
+	assert.deepEqual(r.result.structuredContent, { text: "x" });
+	assert.equal(r.result.content[0].text, "x");
+});
+
+test("expected failures are refused with a code; unexpected ones in actions are unknown", async () => {
+	const refused = await call("refuse");
+	assert.equal(refused.result.isError, true);
+	assert.deepEqual(refused.result.structuredContent, { outcome: "refused", code: "STALE_REF", message: "gone", ref: "a1" });
+	const crashed = await call("crash");
+	assert.equal(crashed.result.structuredContent.outcome, "unknown");
+	assert.equal(crashed.result.structuredContent.code, "BACKEND_ERROR");
+	const unknown: any = await call("nope");
 	assert.equal(unknown.error.code, -32602);
 });
 
 test("notifications/cancelled aborts the running call", async () => {
-	const pending = server.handle({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "slow" } });
+	const pending = call("slow", {}, 7);
 	await server.handle({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 7 } });
-	const r: any = await pending;
-	assert.equal(r.result.isError, true);
-	assert.equal(r.result.content[0].text, "cancelled");
+	const r = await pending;
+	assert.equal(r.result.structuredContent.code, "CANCELLED");
 });
 
 test("dropEmpty clears placeholders only for listed optional keys", () => {
