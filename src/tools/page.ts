@@ -185,12 +185,13 @@ export function pageTools(ctx: Ctx): Tool[] {
 							// Checks come back as {error} before anything changes; a failure after that is not a refusal.
 							const r = await tab.callOn(
 								id,
-								`function(v){ if (this.tagName !== "SELECT") return { error: "not a <select>" }; const o = [...this.options].find(o => o.value === v) ?? [...this.options].find(o => o.label.trim() === v); if (!o) return { error: "no option " + JSON.stringify(v) }; const wanted = o.value; this.value = wanted; this.dispatchEvent(new Event("input", {bubbles: true})); this.dispatchEvent(new Event("change", {bubbles: true})); return { wanted, value: this.value } }`,
+								`function(v){ if (this.tagName !== "SELECT") return { error: "not a <select>" }; const o = [...this.options].find(o => o.value === v) ?? [...this.options].find(o => o.label.trim() === v); if (!o) return { error: "no option " + JSON.stringify(v) }; const wanted = o.index; this.selectedIndex = wanted; this.dispatchEvent(new Event("input", {bubbles: true})); this.dispatchEvent(new Event("change", {bubbles: true})); return { wanted, index: this.selectedIndex, value: this.value } }`,
 								[a.value],
 							);
 							if (r.error) throw new ToolError("BAD_ARGS", r.error);
-							const verified = r.value === r.wanted;
-							return done({ route: "cdp-dom", verified, value: r.value }, `selected ${r.value}${verified ? "" : ` (wanted ${r.wanted}: a change handler reset it?)`}`);
+							// By index: options can share a value, and setting .value picks the first of them.
+							const verified = r.index === r.wanted;
+							return done({ route: "cdp-dom", verified, value: r.value }, `selected ${r.value}${verified ? "" : " (a different option is selected now: a change handler reset it?)"}`);
 						}
 						case "scroll": {
 							if (!a.dx && !a.dy) throw new ToolError("BAD_ARGS", "give dx and/or dy");
@@ -204,7 +205,19 @@ export function pageTools(ctx: Ctx): Tool[] {
 							// Scroll chaining means any scrollable ancestor of the point (or the document) may move: watch them all and
 							// report the one that did.
 							const found = await tab.send("Runtime.evaluate", {
-								expression: `(() => { const out = []; for (let n = document.elementFromPoint(${p.x}, ${p.y}); n && n !== document.body && n !== document.documentElement; n = n.parentElement) { const s = getComputedStyle(n); if (/(auto|scroll|overlay)/.test(s.overflowX + s.overflowY) && (n.scrollHeight > n.clientHeight || n.scrollWidth > n.clientWidth)) out.push(n) } out.push(document.scrollingElement); return out })()`,
+								// Same descent as the hit test: into open shadow roots, then up the composed ancestors (slots, hosts).
+								expression: `(() => {
+									const x = ${p.x}, y = ${p.y}, doc = document.scrollingElement, out = [];
+									let hit = document.elementFromPoint(x, y);
+									while (hit && hit.shadowRoot) { const inner = hit.shadowRoot.elementFromPoint(x, y); if (!inner || inner === hit) break; hit = inner; }
+									for (let n = hit; n; n = n.assignedSlot || n.parentNode || n.host) {
+										if (n.nodeType !== 1 || n === doc) continue;
+										const s = getComputedStyle(n);
+										if (/(auto|scroll|overlay)/.test(s.overflowX + s.overflowY) && (n.scrollHeight > n.clientHeight || n.scrollWidth > n.clientWidth)) out.push(n);
+									}
+									if (doc) out.push(doc);
+									return out;
+								})()`,
 							});
 							const chain = found.result.objectId as string;
 							const read = async () => (await tab.callOn(chain, "function(){ return this.map(e => [e.scrollLeft, e.scrollTop]) }")) as [number, number][];

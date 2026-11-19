@@ -124,7 +124,13 @@ export function createServer(info: ServerInfo) {
 export function serveStdio(server: ReturnType<typeof createServer>, onClose: () => void) {
 	// stdout carries the protocol only: anything a library logs goes to stderr.
 	console.log = console.info = console.debug = console.error;
-	const send = (msg: object) => process.stdout.write(`${JSON.stringify(msg)}\n`);
+	// The client may close the pipe first (it exits): stop writing and shut down, instead of dying on EPIPE mid-gesture.
+	let broken = false;
+	process.stdout.on("error", () => {
+		broken = true;
+		onClose();
+	});
+	const send = (msg: object) => !broken && process.stdout.write(`${JSON.stringify(msg)}\n`);
 	const lines = createInterface({ input: process.stdin });
 	lines.on("line", (line) => {
 		if (!line.trim()) return;

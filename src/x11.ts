@@ -276,11 +276,15 @@ export async function hold(chord: string, ms: number, signal?: AbortSignal) {
 
 export const isTypeable = (text: string) => /^[\x20-\x7E\n\t]*$/.test(text);
 
-export async function type(text: string, signal?: AbortSignal) {
+/** `beforeLine` runs before each line after a Return (which may have moved focus); it can stop the typing by throwing. */
+export async function type(text: string, signal?: AbortSignal, beforeLine?: () => Promise<void>) {
 	// xdotool types "\n" as Linefeed, which GTK ignores: send Return between lines instead.
 	const lines = text.split("\n");
 	for (let i = 0; i < lines.length; i++) {
-		if (i) await gesture(signal, [], [], ["key", "--clearmodifiers", "Return"]);
+		if (i) {
+			await gesture(signal, [], [], ["key", "--clearmodifiers", "Return"]);
+			if (lines[i] && beforeLine) await beforeLine();
+		}
 		// via stdin: text starting with "-" would otherwise be parsed as an option
 		if (lines[i]) await gesture(signal, [], [], ["type", "--clearmodifiers", "--delay", "12", "--file", "-"], lines[i]);
 	}

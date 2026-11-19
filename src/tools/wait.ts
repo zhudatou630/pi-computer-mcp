@@ -110,7 +110,7 @@ export function waitTool(ctx: Ctx): Tool {
 		description: [
 			"Wait (polling, default timeout 10 s, max 60 s) until a condition holds; matched=false on timeout is a normal result, not an error.",
 			"time: ms. window: a window with title/class (substring), pid or id appears, ignoring exclude ids (pass launch's existingWindows); gone=true: none left.",
-			"element: within window | app | ref, an on-screen node with role/name (exact)/query (substring of role, name or value)/states appears (gone=true: disappears; only counted when the scope was read completely). With only ref: that element stays alive (gone=true: it goes away). A busy app or failed read never counts as gone.",
+			"element: within window | app | ref, an on-screen node with role/name (exact)/query (substring of role, name or value)/states appears (gone=true: disappears; only counted when the scope was read completely). query sees the first 500 characters of a field's value. With only ref: that element stays alive (gone=true: it goes away). A busy app or failed read never counts as gone.",
 			"page: in tab, text (in body text) / selector appears (gone=true: disappears), url contains, load (readyState complete); all given parts must hold. A failed read (mid-navigation) counts as no match.",
 		].join("\n"),
 		inputSchema: obj(

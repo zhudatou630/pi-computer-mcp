@@ -1,8 +1,9 @@
 // Pixels and physical input: screenshots, pointer, keyboard (xdotool/XTEST, scrot).
 import { DEFAULT_MAX_EDGE } from "../capture.ts";
 import { dropEmpty, ok, ToolError, type Tool } from "../mcp.ts";
+import { sleep } from "../queue.ts";
 import * as x11 from "../x11.ts";
-import { arr, checkActive, checkLanding, type Ctx, enm, int, num, obj, out, type PointArgs, receipt, rect, resolvePoint, str, windowParam } from "./common.ts";
+import { arr, checkActive, checkLanding, checkPointerOver, type Ctx, enm, int, num, obj, out, type PointArgs, receipt, rect, resolvePoint, str, windowParam } from "./common.ts";
 
 const MODS = arr(enm(["ctrl", "shift", "alt", "super"]), "Modifier keys held during the action");
 const BUTTON = enm(["left", "middle", "right"], "default left");
@@ -99,7 +100,7 @@ export function inputTools(ctx: Ctx): Tool[] {
 		{
 			name: "scroll",
 			kind: "action",
-			description: "Mouse wheel at a point (or wherever the pointer is): dy > 0 scrolls down, dx > 0 right, in wheel clicks (typically ~3 lines each). With window and no point, refused when another window is under the pointer.",
+			description: "Mouse wheel at a point (or wherever the pointer is): dy > 0 scrolls down, dx > 0 right, in wheel clicks (typically ~3 lines each). With window: refused when another app window is under the pointer (menus and popups are allowed).",
 			inputSchema: obj({ ...POINT, dx: int(), dy: int(), modifiers: MODS }),
 			outputSchema: receipt({ at: AT }),
 			run: (raw, signal) =>
@@ -110,7 +111,7 @@ export function inputTools(ctx: Ctx): Tool[] {
 					if (!dx && !dy) throw new ToolError("BAD_ARGS", "give dx and/or dy");
 					const p = a.ref || a.x !== undefined ? await resolvePoint(ctx, a) : undefined;
 					if (p) await checkLanding(p);
-					else if (a.window) await checkLanding({ ...(await x11.pointer()), window: x11.normId(a.window) });
+					else if (a.window) await checkPointerOver(x11.normId(a.window));
 					await x11.scroll(p, dx, dy, { modifiers: raw.modifiers as string[], signal });
 					return ok({ outcome: "delivered", route: "xtest", ...(p ? { at: { x: p.x, y: p.y } } : {}) }, `scrolled ${dx},${dy}`);
 				}),
@@ -145,15 +146,25 @@ export function inputTools(ctx: Ctx): Tool[] {
 		{
 			name: "type",
 			kind: "action",
-			description: "Type ASCII text as keystrokes into the focused window (\\n = Enter, \\t = Tab). Other text (Chinese, emoji, accents) is refused before anything is sent: use set_text on the element, or page_act fill/type in a page.",
+			description: "Type ASCII text as keystrokes into the focused window (\\n = Enter, \\t = Tab). With window, focus is checked before typing and, 300 ms after each Enter, before the next line (best effort: if an Enter may close a dialog, send the lines as separate calls with a wait between); a stop after some lines is outcome unknown. Other text (Chinese, emoji, accents) is refused before anything is sent: use set_text on the element, or page_act fill/type in a page.",
 			inputSchema: obj({ text: str(), window: windowParam }, ["text"]),
 			outputSchema: receipt(),
 			run: (raw, signal) =>
 				ctx.queue.run(signal, async () => {
 					const text = String(raw.text ?? "");
 					if (!x11.isTypeable(text)) throw new ToolError("NOT_ASCII", "text has non-ASCII characters; use set_text (desktop) or page_act fill/type (page)");
-					await checkActive(dropEmpty(raw, ["window"]).window as string | undefined);
-					await x11.type(text, signal);
+					const window = dropEmpty(raw, ["window"]).window as string | undefined;
+					await checkActive(window);
+					const recheck = async () => {
+						try {
+							await sleep(300, signal); // let the Enter take effect: a closing dialog leaves the window list after ~300 ms here
+							await checkActive(window);
+						} catch (e) {
+							// Earlier lines are already typed: never "refused" from here on.
+							throw e instanceof ToolError ? new ToolError(e.code, `${e.message} (earlier lines were already typed)`, { outcome: "unknown", details: e.details }) : e;
+						}
+					};
+					await x11.type(text, signal, window ? recheck : undefined);
 					return ok({ outcome: "delivered", route: "xtest" }, `typed ${text.length} chars`);
 				}),
 		},

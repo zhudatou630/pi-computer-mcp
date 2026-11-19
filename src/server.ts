@@ -34,9 +34,9 @@ Layers (pick per task; nothing falls back silently):
 Contract:
 - Results: data in structuredContent; content[0] is a short text, content[1] the image (show it with image(r.content[1])). Check r.isError: failures resolve with structuredContent {outcome, code, message}. Arguments that break a tool's schema (unknown or missing fields) make the call throw instead.
 - outcome: delivered (sent, effect not implied), refused (the action was not sent: STALE_REF, CAPTURE_STALE, FOCUS_CHANGED, POINTER_ELSEWHERE, OCCLUDED, NOT_ASCII, AMBIGUOUS, APP_BUSY, …; the window check may have moved the pointer), unknown (may have been sent: look before retrying). verified appears only when the effect was checked.
-- Actions do not re-read the screen. Desktop actions do not wait; page navigate/back/forward/reload wait for the page to load (loaded), page scroll for the scroll to settle. Follow actions with wait or observe when the next step depends on the result.
+- Actions do not re-read the screen or wait for effects, with these exceptions: window confirms its op (up to 2 s, verified); page navigate/back/forward/reload wait for the page to load (loaded); page scroll waits for the scroll to settle. Follow actions with wait or observe when the next step depends on the result.
 - Refs and captureIds belong to this server process; keep them across scripts with store(). A stale ref is refused, never re-bound to a look-alike.
-- Pass window to pointer/key tools to refuse input when another window would get it. Input is queued: one action at a time (page_eval and reads are not queued).
+- Pass window to pointer/key tools to refuse input when another app window would get it (menus and popups are allowed). Input is queued: one action at a time (page_eval and reads are not queued).
 - set_text does not move keyboard focus: pass focus=true before pressing keys (e.g. Return) in that field.
 - Chinese and other non-ASCII text: set_text (desktop) or page_act fill/type (page); type is ASCII only.
 - Logins, passwords, 2FA, CAPTCHA: stop and ask the person. Never kill processes you did not start; close windows you opened (window op=close) and tabs you opened (tabs op=close).

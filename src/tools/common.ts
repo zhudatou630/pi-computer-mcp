@@ -37,7 +37,7 @@ export const windowParam = str('X window id ("0x…") from windows. Pointer acti
 
 /** The AT-SPI root for an X window, refusing to guess between look-alike windows. */
 export async function rootForWindow(ctx: Ctx, id: string) {
-	const [{ windows }, roots] = await Promise.all([x11.listWindows(), ctx.atspi.roots()]);
+	const [{ windows }, { roots, unreadablePids }] = await Promise.all([x11.listWindows(), ctx.atspi.roots()]);
 	const win = windows.find((w) => w.id === x11.normId(id));
 	if (!win) throw new ToolError("WINDOW_GONE", `window ${id} no longer exists; call windows`);
 	const m = matchRoots([win, ...windows.filter((w) => w.id !== win.id && w.pid === win.pid)], roots).get(win.id)!;
@@ -45,6 +45,7 @@ export async function rootForWindow(ctx: Ctx, id: string) {
 		const candidates = m.candidates.map((r) => ({ ref: r.ref, role: r.role, name: r.name }));
 		if (candidates.length)
 			throw new ToolError("AMBIGUOUS", `window ${win.id} cannot be told apart from its app's other windows (same title and place); activate it or move it (window op=activate/move), then observe again`, { details: { candidates } });
+		if (win.pid && unreadablePids.includes(win.pid)) throw new ToolError("APP_BUSY", `the app of window ${win.id} did not answer; try again`);
 		throw new ToolError("NO_ACCESSIBLE_ROOT", `window ${win.id} (${win.class}) has no accessibility tree (app started before AT-SPI, Electron, or no a11y support); use screenshot + pointer input`);
 	}
 	ctx.atspi.bindWindow(m.root.ref, win.id);
@@ -79,16 +80,22 @@ export async function resolvePoint(ctx: Ctx, a: PointArgs): Promise<{ x: number;
 export async function checkLanding(p: { x: number; y: number; window?: string }) {
 	if (!p.window) return;
 	await x11.moveTo(p.x, p.y);
-	const [{ window: under }, managed] = await Promise.all([x11.pointer(), x11.managedIds()]);
-	if (under && managed.has(under) && under !== p.window)
-		throw new ToolError("POINTER_ELSEWHERE", `window ${under} is under ${p.x},${p.y}, not ${p.window}; activate the window or take a new screenshot`, { details: { pointerWindow: under } });
+	await checkPointerOver(p.window);
+}
+
+/** Refuse when another managed window is under the pointer where it is now (menus and popups are not managed). */
+export async function checkPointerOver(window: string) {
+	const [{ x, y, window: under }, managed] = await Promise.all([x11.pointer(), x11.managedIds()]);
+	if (under && managed.has(under) && under !== window)
+		throw new ToolError("POINTER_ELSEWHERE", `window ${under} is under ${x},${y}, not ${window}; activate the window or take a new screenshot`, { details: { pointerWindow: under } });
 }
 
 export async function checkActive(window: string | undefined) {
 	if (!window) return;
 	const id = x11.normId(window);
-	const active = await x11.activeWindow();
+	// Both: a closing window leaves the WM's list a few hundred ms before _NET_ACTIVE_WINDOW moves on.
+	const [active, managed] = await Promise.all([x11.activeWindow(), x11.managedIds()]);
+	if (!managed.has(id)) throw new ToolError("WINDOW_GONE", `window ${window} no longer exists; call windows`);
 	if (active === id) return;
-	if (!(await x11.managedIds()).has(id)) throw new ToolError("WINDOW_GONE", `window ${window} no longer exists; call windows`);
 	throw new ToolError("FOCUS_CHANGED", `the active window is ${active ?? "none"}, not ${window}; activate it first`, { details: { active } });
 }

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { matchRoots, stateNames, walk, type Obj, type RawNode, type Root } from "../src/atspi.ts";
+import { AtspiTimeout, matchRoots, readFailure, stateNames, walk, type Obj, type RawNode, type Root } from "../src/atspi.ts";
 import { checkFresh, plan, toScreen, type Capture } from "../src/capture.ts";
-import { axToNodes, parseKey } from "../src/cdp.ts";
+import { axToNodes, parseKey, Tab } from "../src/cdp.ts";
 import { InputQueue, poll } from "../src/queue.ts";
 import { filterNodes, formatTree, type UiNode } from "../src/tree.ts";
 import { interpolate, isTypeable, parseWindows, xpropString } from "../src/x11.ts";
@@ -144,15 +144,52 @@ test("walk keeps what it read within the budget and reports why it stopped", asy
 
 test("walk keeps unnamed on-screen containers only in onScreen mode", async () => {
 	const tree: Record<string, RawNode> = {
-		"/root": { name: "Win", role: "frame", states: [], box: [0, 0, 500, 500], actions: [], kids: [{ dest: "d", path: "/panel" }], partial: false },
+		"/root": { name: "Win", role: "frame", states: [], box: [0, 0, 500, 500], actions: [], kids: [{ dest: "d", path: "/panel" }, { dest: "d", path: "/hidden" }], partial: false },
+		"/hidden": { name: "Old dialog", role: "dialog", states: [], actions: [], kids: [], partial: false },
 		"/panel": { name: "", role: "filler", states: [], box: [0, 0, 500, 500], actions: [], kids: [{ dest: "d", path: "/table" }], partial: false },
 		"/table": { name: "", role: "tree table", states: [], box: [0, 0, 400, 400], actions: [], kids: [{ dest: "d", path: "/off" }], partial: false },
 		"/off": { name: "row", role: "table cell", states: [], box: [-2147483648, -2147483648, 10, 10], actions: [], kids: [], partial: false },
 	};
 	const read = async (o: Obj) => tree[o.path];
 	const roles = async (keep: "default" | "onScreen") => (await walk({ dest: "d", path: "/root" }, read, (o) => o.path, { maxDepth: 8, maxNodes: 100, keep })).nodes.map((n) => n.role);
-	assert.deepEqual(await roles("default"), ["frame", "filler"]); // top two levels only
-	assert.deepEqual(await roles("onScreen"), ["frame", "filler", "tree table"]); // never off-screen nodes
+	assert.deepEqual(await roles("default"), ["frame", "filler", "dialog"]); // top two levels always listed
+	assert.deepEqual(await roles("onScreen"), ["frame", "filler", "tree table"]); // filters: only on-screen nodes below the scope
+});
+
+test("readFailure: only error replies that prove absence mean gone", () => {
+	const reply = (type: string) => Object.assign(new Error(type), { type });
+	assert.equal(readFailure(reply("org.freedesktop.DBus.Error.UnknownObject")), "gone");
+	assert.equal(readFailure(reply("org.freedesktop.DBus.Error.ServiceUnknown")), "gone");
+	assert.equal(readFailure(reply("org.freedesktop.DBus.Error.NoReply")), "busy");
+	assert.equal(readFailure(reply("org.freedesktop.DBus.Error.Failed")), "error");
+	assert.equal(readFailure(new AtspiTimeout("t")), "busy");
+	assert.equal(readFailure(new Error("socket closed")), "error");
+});
+
+test("history reports loaded only for the selected entry's complete document", async () => {
+	// The old page stays complete; the back navigation commits during the first history check after the request,
+	// and the new document stays loading for a few reads.
+	const st = { index: 1, loader: "L1", href: "http://x/b", ready: "complete", requested: false, checks: 0, reads: 0 };
+	const fake = {
+		send: async (method: string) => {
+			if (method === "Page.getNavigationHistory") {
+				if (st.requested && ++st.checks === 2) Object.assign(st, { index: 0, loader: "L0", href: "http://x/a", ready: "loading" });
+				return { currentIndex: st.index, entries: [{ id: 10, url: "http://x/a" }, { id: 11, url: "http://x/b" }] };
+			}
+			if (method === "Page.navigateToHistoryEntry") return void (st.requested = true);
+			if (method === "Page.getFrameTree") return { frameTree: { frame: { loaderId: st.loader } } };
+			if (method === "Runtime.evaluate") {
+				if (st.loader === "L0" && ++st.reads === 3) st.ready = "complete";
+				return { result: { value: [st.href, st.ready] } };
+			}
+			throw new Error(method);
+		},
+	};
+	const tab = new Tab(fake as any, "t", "s", true);
+	const r = await tab.history(-1);
+	assert.deepEqual([r.loaded, st.index, st.ready], [true, 0, "complete"]);
+	st.index = 0;
+	await assert.rejects(tab.history(-1), (e: any) => e.code === "NO_HISTORY");
 });
 
 test("stateNames decodes both 32-bit words", () => {

@@ -36,7 +36,18 @@ export type Coverage = { complete: boolean; visited: number; errors: number; tru
 const unwrap = (v: any) => (v && typeof v === "object" && "signature" in v && "value" in v ? v.value : v);
 
 /** The app did not answer in time: busy or hung, which is not the same as gone. */
-class AtspiTimeout extends Error {}
+export class AtspiTimeout extends Error {}
+
+// Replies that prove the element is gone (seen on this desktop: a removed object, an app that exited).
+const GONE_ERRORS = new Set(["org.freedesktop.DBus.Error.UnknownObject", "org.freedesktop.DBus.Error.ServiceUnknown", "org.freedesktop.DBus.Error.NameHasNoOwner"]);
+
+/** Why a read failed: the element is gone, its app is busy, or something else (which proves nothing). */
+export function readFailure(e: unknown): "gone" | "busy" | "error" {
+	if (e instanceof AtspiTimeout) return "busy";
+	const type = (e as { type?: unknown })?.type;
+	if (e instanceof dbus.DBusError || typeof type === "string") return GONE_ERRORS.has(String(type)) ? "gone" : type === "org.freedesktop.DBus.Error.NoReply" ? "busy" : "error";
+	return "error";
+}
 
 export type Box = [number, number, number, number];
 /** One element as read from the bus. `partial`: some of its reads failed; `statesUnknown`: its states could not be read. */
@@ -85,8 +96,10 @@ export async function walk(root: Obj, read: (o: Obj) => Promise<RawNode>, refOf:
 				if (visible) node.box = n.box;
 				if (isInteractive(node) && !n.statesUnknown && !n.states.includes("sensitive")) node.states = [...node.states, "disabled"];
 				const unnamedCell = n.role === "table cell" && !n.name;
+				// The scope itself is always listed; the default view also lists the level below it (frames, dialogs),
+				// filters only what is on screen.
 				const keep = options.keep === "onScreen" ? visible : visible && (!!n.name || isInteractive(node)) && !unnamedCell;
-				if (n.depth <= 1 || keep) nodes.push(node);
+				if (n.depth === 0 || (n.depth === 1 && options.keep !== "onScreen") || keep) nodes.push(node);
 				// Walk into off-screen containers too: GTK keeps real buttons inside 1x1 boxes.
 				if (n.depth < options.maxDepth) for (const o of n.kids) next.push({ o, depth: n.depth + 1 });
 				else if (n.kids.length) coverage.truncatedBy ??= "maxDepth";
@@ -175,9 +188,9 @@ export class Atspi {
 			this.#call(rec.o, ACC, "GetRoleName").then((r) => String(r[0])),
 			this.#call(rec.o, ACC, "GetState").then((r) => stateNames(r[0])),
 		]).catch((e) => {
-			if (e instanceof AtspiTimeout) throw new ToolError("APP_BUSY", `the app of ${ref} did not answer within ${CALL_MS / 1000} s (busy, or a modal loop); try again`);
-			// An error reply (unknown object, service gone) means the element is gone; anything else (the bus itself) does not.
-			if (e instanceof dbus.DBusError) throw new ToolError("STALE_REF", `${ref} is gone (its window or app closed or rebuilt it); observe again`);
+			const why = readFailure(e);
+			if (why === "busy") throw new ToolError("APP_BUSY", `the app of ${ref} did not answer within ${CALL_MS / 1000} s (busy, or a modal loop); try again`);
+			if (why === "gone") throw new ToolError("STALE_REF", `${ref} is gone (its window or app closed or rebuilt it); observe again`);
 			throw e;
 		});
 		if (state.includes("defunct")) throw new ToolError("STALE_REF", `${ref} is defunct; observe again`);
@@ -186,14 +199,14 @@ export class Atspi {
 	}
 
 	/** Apps on the bus, with their process ids. */
-	/** `unreadable`: the app did not answer in time, so its name is not known. */
+	/** `unreadable`: the app's name could not be read (busy, or an unexplained error), so it may be any app. */
 	async apps(): Promise<{ name: string; o: Obj; pid?: number; unreadable?: boolean }[]> {
 		const [kids] = await this.#call({ dest: "org.a11y.atspi.Registry", path: "/org/a11y/atspi/accessible/root" }, ACC, "GetChildren");
 		const apps = await Promise.all(
 			(kids as [string, string][]).map(async ([dest, path]) => {
 				const o = { dest, path };
 				const [name, pid] = await Promise.all([
-					this.#prop(o, ACC, "Name").then(String, (e) => (e instanceof AtspiTimeout ? undefined : "")),
+					this.#prop(o, ACC, "Name").then(String, (e) => (readFailure(e) === "gone" ? "" : undefined)),
 					this.#call({ dest: "org.freedesktop.DBus", path: "/org/freedesktop/DBus" }, "org.freedesktop.DBus", "GetConnectionUnixProcessID", "s", [dest]).then((r) => Number(r[0]), () => undefined),
 				]);
 				return { name: name ?? "", o, ...(pid ? { pid } : {}), ...(name === undefined ? { unreadable: true } : {}) };
@@ -202,12 +215,18 @@ export class Atspi {
 		return apps.filter((a) => a.name || a.unreadable);
 	}
 
-	/** Top-level frames and dialogs of every app. */
-	async roots(): Promise<Root[]> {
+	/**
+	 * Top-level frames and dialogs of every app, plus the pids whose list may be incomplete (the app did not answer),
+	 * so a missing root there means "unknown", not "none".
+	 */
+	async roots(): Promise<{ roots: Root[]; unreadablePids: number[] }> {
 		const out: Root[] = [];
+		const unreadablePids: number[] = [];
+		const incomplete = (app: { pid?: number }) => app.pid && unreadablePids.push(app.pid);
 		await Promise.all(
-			(await this.apps()).filter((app) => !app.unreadable).map(async (app) => {
-				const [kids] = await this.#call(app.o, ACC, "GetChildren").catch(() => [[]]);
+			(await this.apps()).map(async (app) => {
+				if (app.unreadable) return void incomplete(app);
+				const [kids] = await this.#call(app.o, ACC, "GetChildren").catch((e) => (readFailure(e) !== "gone" && incomplete(app), [[]]));
 				await Promise.all(
 					(kids as [string, string][]).slice(0, 50).map(async ([dest, path]) => {
 						const o = { dest, path };
@@ -222,7 +241,7 @@ export class Atspi {
 				);
 			}),
 		);
-		return out;
+		return { roots: out, unreadablePids };
 	}
 
 	/** Remember which X window a root (and everything observed under it) belongs to. */
@@ -237,7 +256,7 @@ export class Atspi {
 		const exact = apps.filter((a) => a.name.toLowerCase() === needle);
 		const matches = exact.length ? exact : apps.filter((a) => a.name && a.name.toLowerCase().includes(needle));
 		const unreadable = apps.filter((a) => a.unreadable).length;
-		if (!matches.length && unreadable) throw new ToolError("APP_BUSY", `no app matching "${name}" among those that answered; ${unreadable} did not answer in time`);
+		if (!matches.length && unreadable) throw new ToolError("APP_BUSY", `no app matching "${name}" among those that answered; ${unreadable} could not be read`);
 		if (!matches.length) throw new ToolError("NOT_FOUND", `no accessible app matching "${name}"`, { details: { apps: apps.map((a) => a.name) } });
 		if (matches.length > 1) throw new ToolError("AMBIGUOUS", `${matches.length} apps match "${name}"`, { details: { candidates: matches.map((a) => a.name) } });
 		return { ref: this.#ref(matches[0].o, "application"), name: matches[0].name, o: matches[0].o };

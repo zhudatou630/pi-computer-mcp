@@ -29,11 +29,12 @@ export function desktopTools(ctx: Ctx): Tool[] {
 				const q = (a.query as string | undefined)?.toLowerCase();
 				let list = windows.filter((w) => (a.includeHidden ?? true) || !w.hidden).filter((w) => !q || `${w.title} ${w.class} ${w.instance}`.toLowerCase().includes(q));
 				if (a.accessible) {
-					const pairs = matchRoots(windows, await ctx.atspi.roots());
+					const { roots, unreadablePids } = await ctx.atspi.roots();
+					const pairs = matchRoots(windows, roots);
 					list = list.map((w) => {
 						const m = pairs.get(w.id)!;
 						if (m.root) ctx.atspi.bindWindow(m.root.ref, w.id);
-						return { ...w, accessible: m.root ? m.root.ref : m.candidates.length ? "ambiguous" : "none" };
+						return { ...w, accessible: m.root ? m.root.ref : m.candidates.length ? "ambiguous" : w.pid && unreadablePids.includes(w.pid) ? "busy" : "none" };
 					});
 				}
 				const text = [`screen ${screen.width}x${screen.height}, active ${active ?? "none"}`, ...list.map((w) => `${w.id} ${w.class || w.instance} ${JSON.stringify(w.title)} @${w.x},${w.y} ${w.width}x${w.height}${w.active ? " [active]" : ""}${w.hidden ? " [hidden]" : ""}${"accessible" in w ? ` a11y=${(w as any).accessible}` : ""}`)].join("\n");

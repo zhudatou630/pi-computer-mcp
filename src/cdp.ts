@@ -10,11 +10,14 @@ class CdpConnection {
 	#next = 0;
 	#pending = new Map<number, Pending>();
 	closed = false;
+	/** Called when Chromium ends a session (Target.detachedFromTarget), e.g. after its tab crashed. */
+	onDetached?: (sessionId: string) => void;
 
 	constructor(ws: WebSocket) {
 		this.#ws = ws;
 		ws.addEventListener("message", (ev) => {
 			const msg = JSON.parse(String(ev.data));
+			if (msg.method === "Target.detachedFromTarget" && msg.params?.sessionId) this.onDetached?.(msg.params.sessionId);
 			const p = msg.id !== undefined ? this.#pending.get(msg.id) : undefined;
 			if (!p) return;
 			this.#pending.delete(msg.id);
@@ -181,12 +184,17 @@ export class Tab {
 		}
 	}
 
-	/** Poll until the main frame satisfies `done` and its document is complete; false on timeout. */
-	async waitFor(done: (s: { loaderId: string; href: string }) => boolean | Promise<boolean>, timeoutMs = 10_000) {
+	/**
+	 * Poll until the main frame's document is complete and satisfies `done`; false on timeout. `committed` (optional) must
+	 * hold before the snapshot is taken and still after, so the snapshot is of the document it vouches for.
+	 */
+	async waitFor(done: (s: { loaderId: string; href: string }) => boolean, timeoutMs = 10_000, committed?: () => Promise<boolean>) {
 		const end = Date.now() + timeoutMs;
 		while (Date.now() < end) {
-			const s = await this.#snapshot();
-			if (s?.ready === "complete" && (await done(s))) return true;
+			if (!committed || (await committed())) {
+				const s = await this.#snapshot();
+				if (s?.ready === "complete" && done(s) && (!committed || (await committed()))) return true;
+			}
 			await new Promise((r) => setTimeout(r, 150));
 		}
 		return false;
@@ -210,7 +218,7 @@ export class Tab {
 			const now = await this.send("Page.getNavigationHistory");
 			return now.entries[now.currentIndex]?.id === entry.id;
 		};
-		return { url: entry.url as string, loaded: await this.waitFor(current) };
+		return { url: entry.url as string, loaded: await this.waitFor(() => true, 10_000, current) };
 	}
 
 	async reload() {
@@ -259,18 +267,23 @@ export class Tab {
 	/** Is the element at (x,y) the target or inside it? Otherwise something covers it. */
 	async hits(x: number, y: number, backendNodeId: number, ref: string): Promise<boolean> {
 		const target = await this.objectId(backendNodeId, ref);
-		// elementFromPoint takes viewport px like Input events (DOM.getNodeForLocation ignores scrolling). Descend into open
-		// shadow roots, then walk the composed (rendered) ancestors: slotted nodes up through their slot, shadow roots to
-		// their host. Inside a closed shadow root the hit can only be its host: that counts when the target lives there.
+		// elementFromPoint takes viewport px like Input events (DOM.getNodeForLocation ignores scrolling). Descend into shadow
+		// roots (open ones, and closed ones on the target's own path, which the target can reach), then walk the composed
+		// (rendered) ancestors: slotted nodes up through their slot, shadow roots to their host.
 		return this.callOn(
 			target,
 			`function(x, y){
 				const t = this.nodeType === 1 ? this : this.parentElement;
+				const roots = new Map();
+				for (let root = t && t.getRootNode(); root instanceof ShadowRoot; root = root.host.getRootNode()) roots.set(root.host, root);
 				let hit = document.elementFromPoint(x, y);
-				while (hit && hit.shadowRoot) { const inner = hit.shadowRoot.elementFromPoint(x, y); if (!inner || inner === hit) break; hit = inner; }
+				for (;;) {
+					const sr = hit && (hit.shadowRoot || roots.get(hit));
+					const inner = sr && sr.elementFromPoint(x, y);
+					if (!inner || inner === hit) break;
+					hit = inner;
+				}
 				for (let n = hit; n; n = n.assignedSlot || n.parentNode || n.host) if (n === t) return true;
-				for (let root = t && t.getRootNode(); root instanceof ShadowRoot; root = root.host.getRootNode())
-					if (root.mode === "closed" && root.host === hit) return true;
 				return false;
 			}`,
 			[x, y],
@@ -322,6 +335,8 @@ export class Browser {
 	#tabs = new Map<string, Tab>();
 	/** Targets this process created. Kept across reconnects, so its own tabs stay closable. */
 	#owned = new Set<string>();
+	/** Attaches in flight, so parallel calls share one session. */
+	#attaching = new Map<string, Promise<Tab>>();
 	#gen: string;
 	#n = 0;
 	#refs = new Map<string, { targetId: string; loaderId: string; backendId: number }>();
@@ -338,7 +353,12 @@ export class Browser {
 		const existing = current && (await current.catch(() => undefined));
 		// Only the first caller to notice a dead connection replaces it.
 		if ((!existing || existing.closed) && this.#cdp === current) {
-			this.#cdp = connect(this.httpUrl);
+			this.#cdp = connect(this.httpUrl).then((c) => {
+				c.onDetached = (sessionId) => {
+					for (const [id, tab] of this.#tabs) if (tab.sessionId === sessionId) this.#tabs.delete(id);
+				};
+				return c;
+			});
 			this.#tabs.clear();
 		}
 		return this.#cdp!;
@@ -360,7 +380,15 @@ export class Browser {
 		return found;
 	}
 
-	async #attach(targetId: string, owned: boolean) {
+	#attach(targetId: string, owned: boolean): Promise<Tab> {
+		const pending = this.#attaching.get(targetId);
+		if (pending) return pending;
+		const p = this.#attachNow(targetId, owned).finally(() => this.#attaching.delete(targetId));
+		this.#attaching.set(targetId, p);
+		return p;
+	}
+
+	async #attachNow(targetId: string, owned: boolean) {
 		const cdp = await this.#connection();
 		const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
 		const tab = new Tab(cdp, targetId, sessionId, owned);
