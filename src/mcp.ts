@@ -15,6 +15,9 @@ export type Tool = {
 };
 export type ServerInfo = { name: string; version: string; instructions?: string; tools: Tool[] };
 
+/** Default long edge of screenshots: below every model's resize limit (Claude 1568, pi's default 2000), so the model sees exactly these pixels. */
+export const DEFAULT_MAX_EDGE = 1280;
+
 /** How an action ended: refused = certainly not sent; unknown = may have been (partly) sent, do not blindly retry. */
 export type Outcome = "delivered" | "refused" | "unknown";
 

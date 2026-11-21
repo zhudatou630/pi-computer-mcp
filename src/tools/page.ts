@@ -1,9 +1,8 @@
-// Web pages in the shared Chromium over CDP: only tabs this process opened or was told to attach to.
-import { DEFAULT_MAX_EDGE } from "../capture.ts";
+// Web pages over CDP: only tabs this process opened or was told to attach to. Used by both servers.
 import { isPageInteractive, axToNodes, PAGE_HELPERS, parseKey, type Tab } from "../cdp.ts";
-import { dropEmpty, ok, ToolError, type Tool } from "../mcp.ts";
+import { DEFAULT_MAX_EDGE, dropEmpty, ok, ToolError, type Tool } from "../mcp.ts";
 import { filterNodes, formatTree, isFiltered } from "../tree.ts";
-import { arr, bool, type Ctx, enm, int, num, obj, out, receipt, str } from "./common.ts";
+import { arr, bool, enm, int, num, obj, out, type PageCtx, receipt, str } from "./base.ts";
 
 const MAX_EVAL = 20_000;
 const tabParam = str("Tab id from tabs (open or attach first)");
@@ -12,7 +11,7 @@ const tabOut = out({ tab: str(), url: str(), title: str(), mine: bool("opened or
 /** CDP modifier bits from names. */
 const modBits = (mods?: string[]) => (mods ?? []).reduce((b, m) => b | ({ alt: 1, ctrl: 2, control: 2, meta: 4, super: 4, shift: 8 }[m.toLowerCase()] ?? 0), 0);
 
-export function pageTools(ctx: Ctx): Tool[] {
+export function pageTools(ctx: PageCtx): Tool[] {
 	let pageShots = 0;
 	/** Target element -> viewport point, refusing when something else would receive the click. */
 	async function target(tab: Tab, a: { ref?: string; selector?: string; x?: number; y?: number; captureId?: string }): Promise<{ x: number; y: number; backend?: number }> {

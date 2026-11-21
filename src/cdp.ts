@@ -12,12 +12,15 @@ class CdpConnection {
 	closed = false;
 	/** Called when Chromium ends a session (Target.detachedFromTarget), e.g. after its tab crashed. */
 	onDetached?: (sessionId: string) => void;
+	/** Every CDP event (messages with a method). */
+	onEvent?: (method: string, params: any, sessionId?: string) => void;
 
 	constructor(ws: WebSocket) {
 		this.#ws = ws;
 		ws.addEventListener("message", (ev) => {
 			const msg = JSON.parse(String(ev.data));
 			if (msg.method === "Target.detachedFromTarget" && msg.params?.sessionId) this.onDetached?.(msg.params.sessionId);
+			if (msg.method) this.onEvent?.(msg.method, msg.params, msg.sessionId);
 			const p = msg.id !== undefined ? this.#pending.get(msg.id) : undefined;
 			if (!p) return;
 			this.#pending.delete(msg.id);
@@ -325,9 +328,11 @@ export class Tab {
 
 	/** JPEG of the viewport, scaled so the long edge is at most `maxEdge`. */
 	async screenshot(maxEdge: number) {
-		const v = await this.viewport();
+		const [v, dpr] = await Promise.all([this.viewport(), this.eval("devicePixelRatio")]);
 		const scale = Math.min(1, maxEdge / Math.max(v.width, v.height));
-		const shoot = () => this.send("Page.captureScreenshot", { format: "jpeg", quality: 75, clip: { x: v.scrollX, y: v.scrollY, width: v.width, height: v.height, scale } }, 15_000);
+		// The clip scale multiplies device pixels (emulated deviceScaleFactor, browser zoom), not CSS px.
+		const clip = { x: v.scrollX, y: v.scrollY, width: v.width, height: v.height, scale: scale / (Number(dpr) || 1) };
+		const shoot = () => this.send("Page.captureScreenshot", { format: "jpeg", quality: 75, clip }, 15_000);
 		// A tab that is not on screen (an attached background tab) may sit on a capture until another one asks for a
 		// frame: ask again after a moment and take whichever answers first.
 		const first = shoot();
@@ -336,6 +341,9 @@ export class Tab {
 		return { data: data as string, scale, image: { width: Math.round(v.width * scale), height: Math.round(v.height * scale) }, ...v };
 	}
 }
+
+/** Extra per-server behaviour: `attached` runs on every new tab session before it is used; `event` sees every CDP event. */
+export type BrowserHooks = { attached?: (tab: Tab) => Promise<void>; event?: (method: string, params: any, sessionId?: string) => void };
 
 export class Browser {
 	#cdp?: Promise<CdpConnection>;
@@ -351,11 +359,14 @@ export class Browser {
 	#n = 0;
 	#refs = new Map<string, { targetId: string; loaderId: string; backendId: number }>();
 	#keys = new Map<string, string>();
-	readonly httpUrl: string;
+	/** The DevTools HTTP URL, or a function that finds it (e.g. starts a browser) when the first connection is made. */
+	readonly endpoint: string | (() => Promise<string>);
+	readonly hooks: BrowserHooks;
 
-	constructor(httpUrl: string, gen: string) {
-		this.httpUrl = httpUrl;
+	constructor(endpoint: string | (() => Promise<string>), gen: string, hooks: BrowserHooks = {}) {
+		this.endpoint = endpoint;
 		this.#gen = gen;
+		this.hooks = hooks;
 	}
 
 	async #connection() {
@@ -363,7 +374,9 @@ export class Browser {
 		const existing = current && (await current.catch(() => undefined));
 		// Only the first caller to notice a dead connection replaces it.
 		if ((!existing || existing.closed) && this.#cdp === current) {
-			this.#cdp = connect(this.httpUrl).then((c) => {
+			const e = this.endpoint;
+			this.#cdp = (typeof e === "string" ? connect(e) : e().then(connect)).then((c) => {
+				c.onEvent = this.hooks.event;
 				c.onDetached = (sessionId) => {
 					this.#settingUp.delete(sessionId);
 					for (const [id, tab] of this.#tabs) if (tab.sessionId === sessionId) this.#tabs.delete(id);
@@ -412,6 +425,7 @@ export class Browser {
 			// navigation) stalls. Focus emulation makes it render as visible without switching the person's tab.
 			await tab.send("Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
 			await tab.send("Page.setWebLifecycleState", { state: "active" }).catch(() => {});
+			await this.hooks.attached?.(tab);
 		} catch (e) {
 			this.#settingUp.delete(sessionId);
 			throw e;

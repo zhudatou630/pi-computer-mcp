@@ -1,35 +1,14 @@
-// Shared by all tool groups: the server context, JSON-schema shorthands and target resolution.
+// Shared by the computer server's tool groups: the desktop context and target resolution.
 import type { Atspi } from "../atspi.ts";
 import { matchRoots } from "../atspi.ts";
-import type { Browser, PageCapture } from "../cdp.ts";
 import { type Captures, checkFresh, toScreen } from "../capture.ts";
 import { ToolError } from "../mcp.ts";
-import type { InputQueue } from "../queue.ts";
 import * as x11 from "../x11.ts";
+import { type PageCtx, str } from "./base.ts";
 
-export type Ctx = { gen: string; atspi: Atspi; browser: Browser; captures: Captures; pageCaptures: Map<string, PageCapture>; queue: InputQueue };
+export * from "./base.ts";
 
-// ---- schema shorthands ----
-type S = Record<string, unknown>;
-export const str = (description?: string, extra: S = {}): S => ({ type: "string", ...(description ? { description } : {}), ...extra });
-export const num = (description?: string, extra: S = {}): S => ({ type: "number", ...(description ? { description } : {}), ...extra });
-export const int = (description?: string, extra: S = {}): S => ({ type: "integer", ...(description ? { description } : {}), ...extra });
-export const bool = (description?: string): S => ({ type: "boolean", ...(description ? { description } : {}) });
-export const arr = (items: S, description?: string, extra: S = {}): S => ({ type: "array", items, ...(description ? { description } : {}), ...extra });
-export const enm = (values: string[], description?: string): S => ({ type: "string", enum: values, ...(description ? { description } : {}) });
-export const obj = (properties: Record<string, S>, required: string[] = []): S => ({ type: "object", properties, required, additionalProperties: false });
-/** Output schemas describe the main fields; results may carry more. */
-export const out = (properties: Record<string, S>, required: string[] = []): S => ({ type: "object", properties, required, additionalProperties: true });
-
-export const rect = obj({ x: num(), y: num(), width: num(), height: num() }, ["x", "y", "width", "height"]);
-export const RECEIPT = {
-	outcome: enm(["delivered", "refused", "unknown"], "delivered = sent; refused = certainly not sent; unknown = may have been sent, do not blindly retry"),
-	route: str("how it was sent: xtest, atspi-action, atspi-text, wm, spawn, cdp-input, cdp-dom, cdp-page"),
-	verified: bool("present only when the effect was checked afterwards"),
-	code: str("error code when not delivered"),
-	message: str(),
-};
-export const receipt = (extra: Record<string, S> = {}) => out({ ...RECEIPT, ...extra }, ["outcome"]);
+export type Ctx = PageCtx & { atspi: Atspi; captures: Captures };
 
 export const windowParam = str('X window id ("0x…") from windows. Pointer actions (not move) then refuse if another app window is under the pointer (menus and popups are allowed); key/type refuse unless it is the active window.');
 

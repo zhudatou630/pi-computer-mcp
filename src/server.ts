@@ -55,7 +55,7 @@ if (!o.structuredContent.nodes.length) return "no text field found";
 const r = await tools[c+"set_text"]({ ref: o.structuredContent.nodes[0].ref, text: "你好" });
 return r.structuredContent;`;
 
-const server = createServer({ name: "pi-computer", version: "0.3.0", instructions, tools: [...desktopTools(ctx), ...inputTools(ctx), ...pageTools(ctx), waitTool(ctx)] });
+const server = createServer({ name: "pi-computer", version: "0.4.0", instructions, tools: [...desktopTools(ctx), ...inputTools(ctx), ...pageTools(ctx), waitTool(ctx)] });
 
 let closing = false;
 async function shutdown() {

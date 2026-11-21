@@ -1,6 +1,5 @@
 // Pixels and physical input: screenshots, pointer, keyboard (xdotool/XTEST, scrot).
-import { DEFAULT_MAX_EDGE } from "../capture.ts";
-import { dropEmpty, ok, ToolError, type Tool } from "../mcp.ts";
+import { DEFAULT_MAX_EDGE, dropEmpty, ok, ToolError, type Tool } from "../mcp.ts";
 import { sleep } from "../queue.ts";
 import * as x11 from "../x11.ts";
 import { arr, checkActive, checkLanding, checkPointerOver, type Ctx, enm, int, num, obj, out, type PointArgs, receipt, rect, resolvePoint, str, windowParam } from "./common.ts";

@@ -4,11 +4,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ToolError } from "./mcp.ts";
+import { DEFAULT_MAX_EDGE, ToolError } from "./mcp.ts";
 import { run, type Rect, type Size } from "./x11.ts";
 
-/** Below every model's resize limit (Claude 1568, pi's default 2000), so the model sees exactly these pixels. */
-export const DEFAULT_MAX_EDGE = 1280;
 const KEEP = 32;
 
 export type Capture = { id: string; screen: Size; source: Rect; image: Size; window?: { id: string; rect: Rect } };

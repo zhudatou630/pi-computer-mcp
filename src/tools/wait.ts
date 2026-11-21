@@ -1,16 +1,15 @@
 // Waiting happens here because codemode scripts have no timers. Waits never hold the input queue.
 import { isInteractive } from "../atspi.ts";
-import { dropEmpty, ok, ToolError, type Tool } from "../mcp.ts";
-import { poll, sleep } from "../queue.ts";
+import { dropEmpty, ToolError, type Tool } from "../mcp.ts";
 import { filterNodes, isFiltered } from "../tree.ts";
 import * as x11 from "../x11.ts";
-import { arr, bool, type Ctx, enm, int, obj, out, rootForWindow, str } from "./common.ts";
+import { arr, bool, type Ctx, enm, int, obj, rootForWindow, str } from "./common.ts";
+import { PAGE_WAIT_DOC, pageProbe, type PageWaitArgs, runWait, WAIT_INTRO, waitOutput } from "./wait-page.ts";
 
-type Args = {
+type Args = PageWaitArgs & {
 	condition: "time" | "window" | "element" | "page";
 	timeoutMs?: number;
 	ms?: number;
-	gone?: boolean;
 	// window
 	title?: string;
 	class?: string;
@@ -25,13 +24,6 @@ type Args = {
 	name?: string;
 	query?: string;
 	states?: string[];
-	// page (text) or nothing else
-	text?: string;
-	// page
-	tab?: string;
-	selector?: string;
-	url?: string;
-	load?: boolean;
 };
 
 export function waitTool(ctx: Ctx): Tool {
@@ -82,37 +74,14 @@ export function waitTool(ctx: Ctx): Tool {
 		return { matched: a.gone ? matches.length === 0 : matches.length > 0, value: { matches } };
 	}
 
-	async function pageProbe(a: Args) {
-		if (!a.tab) throw new ToolError("BAD_ARGS", "page waits need tab");
-		if (!a.text && !a.selector && !a.url && !a.load) throw new ToolError("BAD_ARGS", "page waits need text, selector, url or load");
-		const tab = await ctx.browser.tab(a.tab);
-		const check = `(() => {
-			let selector = null;
-			if (${JSON.stringify(a.selector ?? null)} !== null) {
-				try { selector = !!document.querySelector(${JSON.stringify(a.selector ?? "")}) } catch { return { badSelector: true } }
-			}
-			return { url: location.href, ready: document.readyState, selector, text: ${a.text ? `(document.body?.innerText ?? "").includes(${JSON.stringify(a.text)})` : "null"} };
-		})()`;
-		// A failed read (e.g. mid-navigation) proves nothing either way: no match, keep polling.
-		const s = (await tab.eval(check).catch(() => undefined)) as { url: string; ready: string; text: boolean | null; selector: boolean | null; badSelector?: true } | undefined;
-		if (s?.badSelector) throw new ToolError("BAD_ARGS", `bad selector ${a.selector}`);
-		if (!s) return { matched: false, value: { url: "", ready: "unknown" } };
-		const conds: boolean[] = [];
-		if (a.text) conds.push(a.gone ? !s.text : !!s.text);
-		if (a.selector) conds.push(a.gone ? !s.selector : !!s.selector);
-		if (a.url) conds.push(s.url.includes(a.url));
-		if (a.load) conds.push(s.ready === "complete");
-		return { matched: conds.every(Boolean), value: { url: s.url, ready: s.ready } };
-	}
-
 	return {
 		name: "wait",
 		kind: "read",
 		description: [
-			"Wait (polling, default timeout 10 s, max 60 s) until a condition holds; matched=false on timeout is a normal result, not an error.",
+			WAIT_INTRO,
 			"time: ms. window: a window with title/class (substring), pid or id appears, ignoring exclude ids (pass launch's existingWindows); gone=true: none left.",
 			"element: within window | app | ref, an on-screen node with role/name (exact)/query (substring of role, name or value)/states appears (gone=true: disappears; only counted when the scope was read completely). query sees the first 500 characters of a field's value. With only ref: that element stays alive (gone=true: it goes away). A busy app or failed read never counts as gone.",
-			"page: in tab, text (in body text) / selector appears (gone=true: disappears), url contains, load (readyState complete); all given parts must hold. A failed read (mid-navigation) counts as no match.",
+			PAGE_WAIT_DOC,
 		].join("\n"),
 		inputSchema: obj(
 			{
@@ -140,20 +109,13 @@ export function waitTool(ctx: Ctx): Tool {
 			},
 			["condition"],
 		),
-		outputSchema: out({ matched: bool(), elapsedMs: int(), result: {} }, ["matched", "elapsedMs"]),
+		outputSchema: waitOutput,
 		async run(raw, signal) {
 			const a = dropEmpty(raw, ["title", "class", "id", "exclude", "window", "app", "ref", "role", "name", "query", "text", "states", "tab", "selector", "url"]) as Args;
-			if (a.condition === "time") {
-				const ms = Math.min(a.ms ?? 0, 60_000);
-				await sleep(ms, signal);
-				return ok({ matched: true, elapsedMs: ms }, `waited ${ms} ms`);
-			}
 			const busyElement = (x: Args) =>
 				elementProbe(x).catch((e) => (e instanceof ToolError && e.code === "APP_BUSY" ? { matched: false, value: { busy: true, complete: false } } : Promise.reject(e)));
-			const probe = a.condition === "window" ? windowProbe : a.condition === "element" ? busyElement : a.condition === "page" ? pageProbe : undefined;
-			if (!probe) throw new ToolError("BAD_ARGS", `unknown condition ${a.condition}`);
-			const r = await poll<unknown>(() => probe(a), { timeoutMs: Math.min(a.timeoutMs ?? 10_000, 60_000), intervalMs: a.condition === "element" ? 300 : 200, signal });
-			return ok({ matched: r.matched, elapsedMs: r.elapsedMs, result: r.value }, `${r.matched ? "matched" : "timed out"} after ${r.elapsedMs} ms: ${JSON.stringify(r.value).slice(0, 1500)}`);
+			const probe = a.condition === "window" ? windowProbe : a.condition === "element" ? busyElement : a.condition === "page" ? (x: Args) => pageProbe(ctx.browser, x) : undefined;
+			return runWait(a, probe && (() => probe(a)), signal, a.condition === "element" ? 300 : 200);
 		},
 	};
 }
