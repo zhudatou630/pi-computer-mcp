@@ -30,20 +30,28 @@ const ctx: PageCtx = {
 const TABS_DOC =
 	"Tabs of this server's own headless Chromium (nobody else uses it). list: its pages; popups a page opened show as [other]: attach to use them. open(url?): a new tab. close(tab): close a tab you opened. attach(tab) / detach(tab): start / stop using a page you did not open. Everything closes when this server exits.";
 
-/** A failure caused by Chromium crashing mid-call says so, instead of a bare "connection closed". */
+/** A call that Chromium crashed during says so, instead of a bare "connection closed" or a timed-out result. */
 function guard(t: Tool): Tool {
 	return {
 		...t,
 		...(t.name === "tabs" ? { description: TABS_DOC } : {}),
 		async run(args, signal) {
 			const crashes = chromium.crashes;
-			try {
-				return await t.run(args, signal);
-			} catch (e) {
-				if (chromium.crashes === crashes) throw e;
+			const crashed = () => {
 				chromium.unreported = false;
-				throw new ToolError("BROWSER_DOWN", `${chromium.lastCrash}; its tabs are gone. Call again to start a new browser`, { outcome: t.kind === "action" ? "unknown" : "refused" });
+				return new ToolError("BROWSER_DOWN", `${chromium.lastCrash}; its tabs are gone. Call again to start a new browser`, { outcome: t.kind === "action" ? "unknown" : "refused" });
+			};
+			let result;
+			try {
+				result = await t.run(args, signal);
+			} catch (e) {
+				// The CDP socket can close a moment before the child's exit event arrives.
+				if (!(e instanceof ToolError)) await sleep(300);
+				if (chromium.crashes !== crashes) throw crashed();
+				throw e;
 			}
+			if (chromium.crashes !== crashes && t.name !== "console") throw crashed();
+			return result;
 		},
 	};
 }

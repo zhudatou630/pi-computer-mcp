@@ -90,8 +90,9 @@ export class ConsoleCollector {
 			}
 			case "Log.entryAdded": {
 				const e = p.entry ?? {};
-				// Failed loads also arrive as Network events, with the URL and method.
-				if (e.source === "network") return;
+				// Failed loads also arrive as Network events, with the URL and method; other network entries (e.g. a failed
+				// WebSocket handshake) only come here.
+				if (e.source === "network" && e.text?.startsWith("Failed to load resource")) return;
 				add({ source: "log", level: e.level === "verbose" ? "debug" : e.level, text: e.text ?? "", ...(e.url ? { url: e.url, ...(e.lineNumber !== undefined ? { line: e.lineNumber + 1 } : {}) } : {}) });
 				return;
 			}

@@ -40,6 +40,7 @@ export function browserTools(ctx: PageCtx, log: ConsoleLog): Tool[] {
 					const a = dropEmpty(raw, ["userAgent"]) as { tab: string; width?: number; height?: number; deviceScaleFactor?: number; mobile?: boolean; userAgent?: string; reset?: boolean };
 					if (!a.reset && (!a.width || !a.height)) throw new ToolError("BAD_ARGS", "give width and height, or reset=true");
 					const tab = await ctx.browser.tab(a.tab);
+					for (const [id, c] of ctx.pageCaptures) if (c.targetId === tab.targetId) ctx.pageCaptures.delete(id);
 					if (a.reset) {
 						await tab.send("Emulation.clearDeviceMetricsOverride");
 						await tab.send("Emulation.setUserAgentOverride", { userAgent: "" });
@@ -47,7 +48,7 @@ export function browserTools(ctx: PageCtx, log: ConsoleLog): Tool[] {
 						await tab.send("Emulation.setDeviceMetricsOverride", { width: a.width, height: a.height, deviceScaleFactor: a.deviceScaleFactor ?? 1, mobile: a.mobile ?? false });
 						if (a.userAgent) await tab.send("Emulation.setUserAgentOverride", { userAgent: a.userAgent });
 					}
-					const now = (await tab.eval("({ width: innerWidth, height: innerHeight, dpr: devicePixelRatio, ua: navigator.userAgent })")) as { width: number; height: number; dpr: number; ua: string };
+					const now = (await tab.eval("({ width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio, ua: navigator.userAgent })")) as { width: number; height: number; dpr: number; ua: string };
 					const data = { outcome: "delivered", route: "cdp-page", viewport: { width: now.width, height: now.height }, devicePixelRatio: now.dpr, userAgent: now.ua };
 					return ok(data, `page sees ${now.width}x${now.height} @${now.dpr}x${a.reset ? " (reset)" : ""}; UA ${now.ua}`);
 				}),

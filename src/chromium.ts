@@ -54,7 +54,12 @@ export class Chromium {
 	}
 
 	async #start(): Promise<string> {
-		const dir = mkdtempSync(join(tmpdir(), "pi-browser-"));
+		let dir: string;
+		try {
+			dir = mkdtempSync(join(tmpdir(), "pi-browser-"));
+		} catch (e) {
+			throw new ToolError("BROWSER_DOWN", `cannot create a Chromium profile directory: ${(e as Error).message}`);
+		}
 		const args = ["--headless=new", "--remote-debugging-port=0", `--user-data-dir=${dir}`, "--no-startup-window", "--window-size=1280,800", "--no-first-run", "--no-default-browser-check"];
 		const proc = spawn(this.binary, args, { stdio: ["ignore", "ignore", "pipe"] });
 		this.#proc = proc;

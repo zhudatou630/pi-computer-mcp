@@ -35,6 +35,8 @@ class CdpConnection {
 	}
 
 	send<T = any>(method: string, params: object = {}, sessionId?: string, timeoutMs = 15_000): Promise<T> {
+		// A closed WebSocket drops sends silently: fail now instead of after the timeout.
+		if (this.closed) return Promise.reject(new Error("CDP connection closed"));
 		const id = ++this.#next;
 		this.#ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
 		return new Promise<T>((resolve, reject) => {
@@ -213,6 +215,8 @@ export class Tab {
 	async waitFor(done: (s: { loaderId: string }) => boolean, timeoutMs = 10_000, committed?: () => Promise<boolean>) {
 		const end = Date.now() + timeoutMs;
 		while (Date.now() < end) {
+			// Failed reads count as "still navigating", but a dead connection never recovers.
+			if (this.cdp.closed) throw new Error("CDP connection closed");
 			if (!committed || (await committed())) {
 				const s = await this.#snapshot();
 				if (s?.ready === "complete" && done(s) && (!committed || (await committed()))) return true;
@@ -328,7 +332,7 @@ export class Tab {
 
 	/** JPEG of the viewport, scaled so the long edge is at most `maxEdge`. */
 	async screenshot(maxEdge: number) {
-		const [v, dpr] = await Promise.all([this.viewport(), this.eval("devicePixelRatio")]);
+		const [v, dpr] = await Promise.all([this.viewport(), this.eval("window.devicePixelRatio")]);
 		const scale = Math.min(1, maxEdge / Math.max(v.width, v.height));
 		// The clip scale multiplies device pixels (emulated deviceScaleFactor, browser zoom), not CSS px.
 		const clip = { x: v.scrollX, y: v.scrollY, width: v.width, height: v.height, scale: scale / (Number(dpr) || 1) };

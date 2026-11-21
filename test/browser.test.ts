@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { test } from "node:test";
+import { Tab } from "../src/cdp.ts";
 import { parseActivePort } from "../src/chromium.ts";
 import { ConsoleCollector, ConsoleLog } from "../src/console.ts";
 import { pageWaitTool } from "../src/tools/wait-page.ts";
@@ -49,7 +50,8 @@ test("console collector turns CDP events of watched sessions into entries", () =
 	c.event("Runtime.consoleAPICalled", { type: "error", args: [{ type: "string", value: "bad" }, { type: "number", value: 42 }, { type: "object", subtype: "array", description: "Array(2)", preview: { properties: [{ value: "1" }, { value: "2" }] } }], stackTrace: { callFrames: [frame] } }, "s1");
 	c.event("Runtime.consoleAPICalled", { type: "warning", args: [{ type: "object", description: "Object", preview: { properties: [{ name: "n", value: "Ada" }] } }] }, "s1");
 	c.event("Runtime.exceptionThrown", { exceptionDetails: { text: "Uncaught", url: "http://h/app.js", lineNumber: 0, exception: { description: "Error: boom\n    at f" } } }, "s1");
-	c.event("Log.entryAdded", { entry: { source: "network", level: "error", text: "Failed to load resource" } }, "s1");
+	c.event("Log.entryAdded", { entry: { source: "network", level: "error", text: "Failed to load resource: the server responded with a status of 404" } }, "s1");
+	c.event("Log.entryAdded", { entry: { source: "network", level: "error", text: "WebSocket connection to 'ws://h/hmr' failed: 404" } }, "s1");
 	c.event("Log.entryAdded", { entry: { source: "deprecation", level: "warning", text: "old API" } }, "s1");
 	c.event("Network.requestWillBeSent", { requestId: "r1", request: { url: "http://h/api", method: "POST" } }, "s1");
 	c.event("Network.responseReceived", { requestId: "r1", type: "Fetch", response: { url: "http://h/api", status: 500, statusText: "Internal Server Error" } }, "s1");
@@ -65,6 +67,7 @@ test("console collector turns CDP events of watched sessions into entries", () =
 		{ source: "console", level: "error", text: "bad 42 Array(2) [1, 2]", url: "http://h/app.js", line: 10 },
 		{ source: "console", level: "warning", text: "Object {n: Ada}" },
 		{ source: "exception", level: "error", text: "Error: boom\n    at f", url: "http://h/app.js", line: 1 },
+		{ source: "log", level: "error", text: "WebSocket connection to 'ws://h/hmr' failed: 404" },
 		{ source: "log", level: "warning", text: "old API" },
 		{ source: "network", level: "error", text: "500 Internal Server Error POST http://h/api (Fetch)", url: "http://h/api", status: 500 },
 		{ source: "network", level: "error", text: "net::ERR_NAME_NOT_RESOLVED GET http://nowhere/x.js (Script)", url: "http://nowhere/x.js" },
@@ -96,6 +99,13 @@ test("browser wait offers only time and page", async () => {
 	const late = await t.run({ condition: "page", tab: "T", load: true, timeoutMs: 0 }, noSignal);
 	assert.equal(late.structuredContent!.matched, false);
 	assert.equal((await t.run({ condition: "time", ms: 1 }, noSignal)).structuredContent!.matched, true);
+});
+
+test("a load wait ends at once when the CDP connection is gone, instead of timing out", async () => {
+	const tab = new Tab({ closed: true, send: () => Promise.reject(new Error("CDP connection closed")) } as any, "t", "s", true);
+	const start = Date.now();
+	await assert.rejects(tab.waitFor(() => true, 5_000), /connection closed/);
+	assert.ok(Date.now() - start < 1000);
 });
 
 test("the browser server never loads the desktop modules", () => {
