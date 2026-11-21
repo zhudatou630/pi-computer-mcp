@@ -24,6 +24,7 @@ export class Chromium {
 	#url?: Promise<string>;
 	#stderr = "";
 	#closing = false;
+	#stopping?: Promise<void>;
 	/** Unexpected exits of a running browser so far, and the last one's description. */
 	crashes = 0;
 	lastCrash = "";
@@ -110,10 +111,25 @@ export class Chromium {
 		throw new ToolError("BROWSER_DOWN", `Chromium did not report a DevTools port within ${START_TIMEOUT_MS / 1000} s${this.#tail() ? `: ${this.#tail()}` : ""}`);
 	}
 
-	/** Stop Chromium (SIGTERM, then SIGKILL), wait for it and for its profile to be deleted. */
+	/** Stop Chromium for good (server exit). */
 	async close() {
 		this.#closing = true;
+		await this.#stopping; // an idle stop in progress
+		await this.stop();
+	}
+
+	/** Stop Chromium (SIGTERM, then SIGKILL), wait for it and for its profile to be deleted; url() starts a new one. */
+	stop() {
+		this.#stopping = this.#stop();
+		return this.#stopping;
+	}
+
+	async #stop() {
 		const p = this.#proc;
+		const dir = this.#dir;
+		// Forgotten first, so its exit is not taken for a crash.
+		this.#proc = undefined;
+		this.#url = undefined;
 		if (p && p.exitCode === null && p.signalCode === null) {
 			const exited = new Promise((r) => p.once("exit", r));
 			p.kill("SIGTERM");
@@ -122,9 +138,9 @@ export class Chromium {
 				await Promise.race([exited, sleep(1000)]);
 			}
 		}
-		for (let i = 0; i < 15 && this.#dir && existsSync(this.#dir); i++) {
+		for (let i = 0; i < 15 && dir && existsSync(dir); i++) {
 			try {
-				rmSync(this.#dir, { recursive: true, force: true });
+				rmSync(dir, { recursive: true, force: true });
 			} catch {}
 			await sleep(200);
 		}

@@ -15,7 +15,7 @@
 | 浏览器页面 | `tabs` `page_observe` `page_act` `page_eval` `page_screenshot` |
 | 等待 | `wait` |
 
-browser 有 `tabs` `page_observe` `page_act` `page_eval` `page_screenshot`、只含 time/page 条件的 `wait`，以及 `console`（console 输出、未捕获异常、日志、失败请求）和 `viewport`（模拟尺寸、DPR、mobile、UA）。
+browser 有 `tabs` `page_observe` `page_act` `page_eval` `page_screenshot`、只含 time/page 条件（另加 `networkIdle`）的 `wait`，以及 `console`（console 输出、未捕获异常、日志、失败请求）和 `viewport`（模拟尺寸、DPR、mobile、UA）。
 
 结果约定（`structuredContent`、`outcome` 为 delivered / refused / unknown、错误码）写在 server 的 instructions 和各工具描述里，codemode 里用 `describeNamespace` 查看。
 
@@ -47,7 +47,7 @@ browser 不需要 X 和 D-Bus，但要以普通用户运行：Chromium 不允许
 }
 ```
 
-第一次调用要用浏览器的工具时才启动 Chromium（默认 `/usr/bin/chromium`，可用 `PI_BROWSER_CHROMIUM` 改），server 退出时关掉它并删除临时 profile。
+第一次调用要用浏览器的工具时才启动 Chromium（默认 `/usr/bin/chromium`，可用 `PI_BROWSER_CHROMIUM` 改），空闲 15 分钟（`PI_BROWSER_IDLE_MINUTES`）或 server 退出时关掉它并删除临时 profile，空闲关掉后下次调用再重启。
 
 系统依赖：`xdotool`、`scrot`、`xprop`、`xwininfo`、`wmctrl`。
 

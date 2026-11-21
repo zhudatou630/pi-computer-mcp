@@ -46,12 +46,35 @@ export async function runWait(a: { condition: string; ms?: number; timeoutMs?: n
 	return ok({ matched: r.matched, elapsedMs: r.elapsedMs, result: r.value }, `${r.matched ? "matched" : "timed out"} after ${r.elapsedMs} ms: ${JSON.stringify(r.value).slice(0, 1500)}`);
 }
 
-/** The browser server's wait: time and page conditions only. */
-export function pageWaitTool(ctx: Pick<PageCtx, "browser">): Tool {
+export const NETWORK_QUIET_MS = 500;
+
+/** Network idle: nothing in flight and no request activity for NETWORK_QUIET_MS, counted from the wait's start at the earliest. */
+export function isNetworkIdle(n: { inflight: number; last: number }, waitStart: number, now: number) {
+	return n.inflight === 0 && now - Math.max(n.last, waitStart) >= NETWORK_QUIET_MS;
+}
+
+/**
+ * The browser server's wait: time and page conditions only. With `network` (requests per tab) page waits also take
+ * networkIdle.
+ */
+export function pageWaitTool(ctx: Pick<PageCtx, "browser">, network: (tab: string) => { inflight: number; last: number } | undefined): Tool {
+	async function probe(a: PageWaitArgs & { networkIdle?: boolean }, start: number) {
+		if (!a.networkIdle) return pageProbe(ctx.browser, a);
+		if (!a.tab) throw new ToolError("BAD_ARGS", "page waits need tab");
+		const n = network(a.tab);
+		if (!n) throw new ToolError("NOT_ATTACHED", `tab ${a.tab} is not one of yours; open it (or attach to it) with tabs first`);
+		const page = a.text || a.selector || a.url || a.load ? await pageProbe(ctx.browser, a) : { matched: true, value: {} };
+		return { matched: page.matched && isNetworkIdle(n, start, Date.now()), value: { ...page.value, inflight: n.inflight } };
+	}
 	return {
 		name: "wait",
 		kind: "read",
-		description: [WAIT_INTRO, "time: ms.", PAGE_WAIT_DOC].join("\n"),
+		description: [
+			WAIT_INTRO,
+			"time: ms.",
+			PAGE_WAIT_DOC,
+			`networkIdle (page): no request in flight for ${NETWORK_QUIET_MS} ms (WebSockets do not count; a page with a long-lived request such as SSE or long polling never gets there). Alone or with the other page parts; e.g. after a click that loads data.`,
+		].join("\n"),
 		inputSchema: obj(
 			{
 				condition: enm(["time", "page"]),
@@ -63,13 +86,15 @@ export function pageWaitTool(ctx: Pick<PageCtx, "browser">): Tool {
 				selector: str(),
 				url: str(),
 				load: bool(),
+				networkIdle: bool(),
 			},
 			["condition"],
 		),
 		outputSchema: waitOutput,
 		run(raw, signal) {
-			const a = dropEmpty(raw, ["text", "tab", "selector", "url"]) as PageWaitArgs & { condition: string };
-			return runWait(a, a.condition === "page" ? () => pageProbe(ctx.browser, a) : undefined, signal);
+			const a = dropEmpty(raw, ["text", "tab", "selector", "url"]) as PageWaitArgs & { condition: string; networkIdle?: boolean };
+			const start = Date.now();
+			return runWait(a, a.condition === "page" ? () => probe(a, start) : undefined, signal);
 		},
 	};
 }

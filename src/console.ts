@@ -56,11 +56,13 @@ function argText(a: any): string {
 	return a.description ?? a.type;
 }
 
-/** Routes CDP events from watched sessions into a ConsoleLog. */
+/** Routes CDP events from watched sessions into a ConsoleLog, and counts each tab's requests in flight. */
 export class ConsoleCollector {
 	readonly log: ConsoleLog;
 	#sessions = new Map<string, string>();
-	#requests = new Map<string, { url: string; method: string }>();
+	#requests = new Map<string, { url: string; method: string; tab: string }>();
+	/** When each tab last started or ended a request (or was first watched). */
+	#lastNet = new Map<string, number>();
 
 	constructor(log = new ConsoleLog()) {
 		this.log = log;
@@ -69,6 +71,16 @@ export class ConsoleCollector {
 	watch(sessionId: string, tab: string) {
 		this.#sessions.set(sessionId, tab);
 		this.log.watch(tab);
+		this.#lastNet.set(tab, Date.now());
+	}
+
+	/** Requests in flight and the time of the last request activity; undefined for a tab never watched. */
+	network(tab: string) {
+		const last = this.#lastNet.get(tab);
+		if (last === undefined) return undefined;
+		let inflight = 0;
+		for (const r of this.#requests.values()) if (r.tab === tab) inflight++;
+		return { inflight, last };
 	}
 
 	event(method: string, p: any, sessionId?: string) {
@@ -76,6 +88,7 @@ export class ConsoleCollector {
 		if (!tab) return;
 		const add = (e: NewEntry) => this.log.add(tab, e);
 		const key = `${sessionId}:${p?.requestId}`;
+		if (method.startsWith("Network.")) this.#lastNet.set(tab, Date.now());
 		switch (method) {
 			case "Runtime.consoleAPICalled": {
 				const frame = p.stackTrace?.callFrames?.[0];
@@ -97,7 +110,7 @@ export class ConsoleCollector {
 				return;
 			}
 			case "Network.requestWillBeSent":
-				this.#requests.set(key, { url: p.request.url, method: p.request.method });
+				this.#requests.set(key, { url: p.request.url, method: p.request.method, tab });
 				if (this.#requests.size > MAX_REQUESTS) this.#requests.delete(this.#requests.keys().next().value!);
 				return;
 			case "Network.responseReceived": {

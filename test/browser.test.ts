@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { test } from "node:test";
 import { Tab } from "../src/cdp.ts";
-import { parseActivePort } from "../src/chromium.ts";
+import { Chromium, parseActivePort } from "../src/chromium.ts";
 import { ConsoleCollector, ConsoleLog } from "../src/console.ts";
-import { pageWaitTool } from "../src/tools/wait-page.ts";
+import { isNetworkIdle, pageWaitTool } from "../src/tools/wait-page.ts";
 import { waitTool } from "../src/tools/wait.ts";
 
 test("parseActivePort reads port and path, and waits for a complete file", () => {
@@ -90,7 +91,7 @@ test("computer wait keeps its contract after the page part moved out", async () 
 });
 
 test("browser wait offers only time and page", async () => {
-	const t = pageWaitTool({ browser: fakeBrowser({ url: "http://h/", ready: "loading", selector: false, text: null }) });
+	const t = pageWaitTool({ browser: fakeBrowser({ url: "http://h/", ready: "loading", selector: false, text: null }) }, () => undefined);
 	assert.deepEqual((t.inputSchema as any).properties.condition.enum, ["time", "page"]);
 	await assert.rejects(t.run({ condition: "window", title: "x" }, noSignal), /unknown condition window/);
 	await assert.rejects(t.run({ condition: "page", tab: "T" }, noSignal), /need text, selector, url or load/);
@@ -99,6 +100,75 @@ test("browser wait offers only time and page", async () => {
 	const late = await t.run({ condition: "page", tab: "T", load: true, timeoutMs: 0 }, noSignal);
 	assert.equal(late.structuredContent!.matched, false);
 	assert.equal((await t.run({ condition: "time", ms: 1 }, noSignal)).structuredContent!.matched, true);
+});
+
+test("network idle: nothing in flight and quiet since the last request and the wait's start", () => {
+	assert.equal(isNetworkIdle({ inflight: 1, last: 0 }, 0, 10_000), false);
+	assert.equal(isNetworkIdle({ inflight: 0, last: 0 }, 0, 499), false);
+	assert.equal(isNetworkIdle({ inflight: 0, last: 0 }, 0, 500), true);
+	assert.equal(isNetworkIdle({ inflight: 0, last: 0 }, 9_800, 10_000), false); // the wait just started
+	assert.equal(isNetworkIdle({ inflight: 0, last: 9_800 }, 0, 10_000), false); // a request just ended
+});
+
+test("the collector counts requests in flight per tab", () => {
+	const c = new ConsoleCollector();
+	assert.equal(c.network("T1"), undefined);
+	c.watch("s1", "T1");
+	c.watch("s2", "T2");
+	const req = (s: string, id: string) => c.event("Network.requestWillBeSent", { requestId: id, request: { url: "http://h/" + id, method: "GET" } }, s);
+	req("s1", "a");
+	req("s1", "b");
+	req("s2", "a");
+	assert.equal(c.network("T1")!.inflight, 2);
+	c.event("Network.loadingFinished", { requestId: "a" }, "s1");
+	c.event("Network.loadingFailed", { requestId: "b", type: "Fetch", errorText: "net::ERR_FAILED" }, "s1");
+	assert.equal(c.network("T1")!.inflight, 0);
+	assert.equal(c.network("T2")!.inflight, 1);
+});
+
+test("browser wait: networkIdle needs a watched tab and a quiet network", async () => {
+	const nets: Record<string, { inflight: number; last: number }> = { busy: { inflight: 1, last: 0 }, quiet: { inflight: 0, last: 0 } };
+	const t = pageWaitTool({ browser: fakeBrowser({ url: "http://h/", ready: "complete", selector: true, text: true }) }, (tab) => nets[tab]);
+	assert.ok((t.inputSchema as any).properties.networkIdle);
+	await assert.rejects(t.run({ condition: "page", tab: "nope", networkIdle: true }, noSignal), (e: any) => e.code === "NOT_ATTACHED");
+	const busy = await t.run({ condition: "page", tab: "busy", networkIdle: true, timeoutMs: 700 }, noSignal);
+	assert.deepEqual(busy.structuredContent!.result, { inflight: 1 });
+	assert.equal(busy.structuredContent!.matched, false);
+	const quiet = await t.run({ condition: "page", tab: "quiet", networkIdle: true, text: "ok", timeoutMs: 2000 }, noSignal);
+	assert.equal(quiet.structuredContent!.matched, true);
+	assert.ok((quiet.structuredContent!.elapsedMs as number) >= 500);
+});
+
+test("launcher: lazy start, stop is not a crash, a crash is reported once, profiles are deleted", async () => {
+	// A stand-in for Chromium: writes DevToolsActivePort into its --user-data-dir and lives on.
+	const bin = mkdtempSync(resolve(tmpdir(), "fake-chromium-"));
+	const exe = resolve(bin, "chromium");
+	writeFileSync(exe, '#!/bin/sh\nfor a in "$@"; do case "$a" in --user-data-dir=*) d="${a#--user-data-dir=}";; esac; done\necho $$ > "$(dirname "$0")/pid"\nprintf "9222\\n/devtools/browser/x\\n" > "$d/DevToolsActivePort"\nexec sleep 30\n');
+	chmodSync(exe, 0o755);
+	const profiles = () => readdirSync(tmpdir()).filter((f) => f.startsWith("pi-browser-")).length;
+	const before = profiles();
+	const c = new Chromium(exe);
+	try {
+		assert.equal(await c.url(), "http://127.0.0.1:9222");
+		assert.equal(await c.url(), "http://127.0.0.1:9222"); // the same browser
+		assert.equal(profiles(), before + 1);
+		await c.stop();
+		assert.equal(profiles(), before);
+		assert.equal(c.crashes, 0);
+		await c.url(); // started again
+		process.kill(Number(readFileSync(resolve(bin, "pid"), "utf8")), "SIGKILL");
+		await new Promise((r) => setTimeout(r, 300));
+		assert.equal(c.crashes, 1);
+		await assert.rejects(c.url(), (e: any) => e.code === "BROWSER_DOWN" && /killed by SIGKILL/.test(e.message));
+		await c.url(); // reported once: the next call starts a new one
+		await c.close();
+		await assert.rejects(c.url(), (e: any) => e.code === "SHUTTING_DOWN");
+		assert.equal(profiles(), before);
+	} finally {
+		c.killNow();
+		rmSync(bin, { recursive: true, force: true });
+	}
+	assert.equal(existsSync(bin), false);
 });
 
 test("a load wait ends at once when the CDP connection is gone, instead of timing out", async () => {
